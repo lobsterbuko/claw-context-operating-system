@@ -16,6 +16,25 @@ import type {
 } from "openclaw/plugin-sdk";
 import { ContextAssembler } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
+import {
+  buildManifestRef,
+  defaultManifestDir,
+  writeContextManifest,
+  type ContextManifest,
+  type OzempicFeatureFlags,
+} from "./context-manifest.js";
+import {
+  loadContextPolicy,
+  resolveToolProvenanceWithPolicy,
+  type ContextPolicy,
+} from "./context-policy.js";
+import {
+  extractToolResultsFromMessages,
+  loadSessionState,
+  renderSessionStateBlock,
+  estimateSessionStateTokens,
+  updateSessionState,
+} from "./session-state.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmConnection, closeLcmConnection } from "./db/connection.js";
 import { getLcmDbFeatures } from "./db/features.js";
@@ -596,6 +615,10 @@ export class LcmContextEngine implements ContextEngine {
   private sessionOperationQueues = new Map<string, Promise<void>>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
+  /** Cache: agentId → loaded ContextPolicy (null = file missing/invalid). */
+  private contextPolicyCache = new Map<string, ContextPolicy | null>();
+  /** Guard: prevents concurrent session state model calls from saturating the summary model. */
+  private sessionStateUpdateInFlight = false;
   private deps: LcmDependencies;
 
   constructor(deps: LcmDependencies) {
@@ -743,6 +766,7 @@ export class LcmContextEngine implements ContextEngine {
         deps: this.deps,
         legacyParams: lp,
         customInstructions: params.customInstructions,
+        summaryModelThinking: this.deps.config.summaryModelThinking,
       });
       if (runtimeSummarizer) {
         return runtimeSummarizer;
@@ -753,6 +777,67 @@ export class LcmContextEngine implements ContextEngine {
     }
     console.error(`[lcm] resolveSummarize: FALLING BACK TO EMERGENCY TRUNCATION`);
     return createEmergencyFallbackSummarize();
+  }
+
+  /**
+   * Resolve the summary model provider/model/apiKey for session state updates.
+   * Uses the same model resolution logic as the summarizer.
+   * Returns null if resolution fails (session state update will be skipped).
+   */
+  private async resolveSummaryModelAccess(
+    legacyParams?: Record<string, unknown>,
+  ): Promise<{ provider: string; model: string; apiKey?: string; providerApi?: string } | null> {
+    const lp = legacyParams ?? {};
+    const providerHint = typeof lp.provider === "string" ? lp.provider.trim() : "";
+    const modelHint = typeof lp.model === "string" ? lp.model.trim() : "";
+    try {
+      const resolved = this.deps.resolveModel(modelHint || undefined, providerHint || undefined);
+      const { provider, model } = resolved;
+      if (!provider || !model) return null;
+      const apiKey = await this.deps.getApiKey(provider, model, {});
+      // Resolve provider API hint from config (same as summarize.ts)
+      let providerApi: string | undefined;
+      const configObj = lp.config as { models?: { providers?: Record<string, { api?: string }> } } | undefined;
+      const providerEntry = configObj?.models?.providers?.[provider];
+      if (providerEntry?.api) providerApi = providerEntry.api;
+      return { provider, model, apiKey, providerApi };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Load (and cache) the context policy for the agent owning a session.
+   *
+   * Policy files live at <openclaw-root>/workspace-<agentId>/context-policy.json.
+   * The openclaw root is inferred as the parent of the database path (typically
+   * ~/.openclaw). Falls back to homedir() + "/.openclaw" if inference fails.
+   *
+   * Returns null when no policy file exists, which disables all Tier 3 features.
+   */
+  private loadPolicyForSession(sessionId: string, sessionFile?: string): ContextPolicy | null {
+    // Extract agentId from session key (format: "agent:<agentId>:<suffix>")
+    const parsed = this.deps.parseAgentSessionKey?.(sessionId);
+    const rawAgentId = parsed?.agentId;
+    // Fallback: extract agentId from session file path (.../agents/<agentId>/sessions/...)
+    const agentIdFromFile = !rawAgentId && sessionFile
+      ? sessionFile.match(/[/\\]agents[/\\]([^/\\]+)[/\\]sessions[/\\]/)?.[1]
+      : undefined;
+    const agentId = this.deps.normalizeAgentId?.(rawAgentId ?? agentIdFromFile) ?? rawAgentId ?? agentIdFromFile ?? "main";
+
+    if (this.contextPolicyCache.has(agentId)) {
+      return this.contextPolicyCache.get(agentId) ?? null;
+    }
+
+    // Derive openclaw root from the DB path: the DB is at <root>/lcm.db or <root>/*.db
+    const dbPath = this.config.databasePath ?? "";
+    const dbDir = dbPath.includes("/") ? dbPath.slice(0, dbPath.lastIndexOf("/")) : "";
+    const openclawRoot = dbDir || join(homedir(), ".openclaw");
+
+    const policyPath = join(openclawRoot, `workspace-${agentId}`, "context-policy.json");
+    const policy = loadContextPolicy(policyPath);
+    this.contextPolicyCache.set(agentId, policy);
+    return policy;
   }
 
   /**
@@ -779,6 +864,7 @@ export class LcmContextEngine implements ContextEngine {
       const summarize = await createLcmSummarizeFromLegacyParams({
         deps: this.deps,
         legacyParams: { provider, model },
+        summaryModelThinking: this.deps.config.summaryModelThinking,
       });
       if (!summarize) {
         return undefined;
@@ -1219,6 +1305,85 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
+  /**
+   * Check whether session state update should run for this turn and, if so,
+   * call the summary model to update it. Always fail-open.
+   *
+   * The in-flight guard prevents concurrent 9B model calls: if a session state
+   * update from the previous turn is still running, this turn's update is skipped.
+   * The 30s timeout inside updateSessionState() ensures the guard always resets.
+   */
+  private async maybeUpdateSessionState(
+    sessionId: string,
+    newMessages: AgentMessage[],
+    legacyParams?: Record<string, unknown>,
+    sessionFile?: string,
+  ): Promise<void> {
+    if (this.sessionStateUpdateInFlight) {
+      this.deps.log.warn(
+        "[lcm] session-state: skipping update — previous turn's update still in flight",
+      );
+      return;
+    }
+    this.sessionStateUpdateInFlight = true;
+    try {
+      const policy = this.loadPolicyForSession(sessionId, sessionFile);
+      const ssConfig = policy?.sessionState;
+      if (!ssConfig?.enabled) return;
+
+      const toolResults = extractToolResultsFromMessages(
+        newMessages as Array<{ role: string; content: unknown }>,
+      );
+      if (toolResults.length === 0) return;
+
+      // Check whether any tool result qualifies for an update
+      const hasMutation = toolResults.some(
+        (r) => resolveToolProvenanceWithPolicy(r.toolName, policy) === "mutation",
+      );
+      if (ssConfig.updateOn === "mutation" && !hasMutation) return;
+
+      // Always resolve credentials via resolveSummaryModelAccess (handles apiKey,
+      // providerApi, auth profile, etc.), then override provider/model if a
+      // dedicated session state model is configured in the agent policy.
+      const modelAccess = await this.resolveSummaryModelAccess(legacyParams);
+      if (!modelAccess) return;
+
+      const ssProvider = ssConfig.provider ?? modelAccess.provider;
+      const ssModel = ssConfig.model ?? modelAccess.model;
+      const ssApiKey = modelAccess.apiKey;
+      const ssProviderApi = modelAccess.providerApi;
+
+      const agentId =
+        this.deps.normalizeAgentId?.(
+          this.deps.parseAgentSessionKey?.(sessionId)?.agentId,
+        ) ?? "main";
+
+      const db = getLcmConnection(this.config.databasePath);
+
+      await updateSessionState({
+        db,
+        sessionId,
+        agentId,
+        config: ssConfig,
+        toolResults,
+        timezone: this.timezone,
+        complete: this.deps.complete,
+        provider: ssProvider,
+        model: ssModel,
+        apiKey: ssApiKey,
+        providerApi: ssProviderApi,
+        thinkingEnabled: ssConfig.thinkingEnabled ?? this.deps.config.summaryModelThinking,
+        log: this.deps.log,
+      });
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] session-state: maybeUpdateSessionState failed — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      this.sessionStateUpdateInFlight = false;
+    }
+  }
+
   async afterTurn(params: {
     sessionId: string;
     sessionFile: string;
@@ -1254,6 +1419,10 @@ export class LcmContextEngine implements ContextEngine {
     } catch {
       // Continue with proactive compaction even if ingest fails.
     }
+
+    // Ozempic Tier 3: session state update (fire-and-forget, best-effort).
+    // Run after ingest so it doesn't block compaction if the model is slow.
+    void this.maybeUpdateSessionState(params.sessionId, newMessages, params.legacyCompactionParams, params.sessionFile);
 
     const tokenBudget =
       typeof params.tokenBudget === "number" &&
@@ -1342,10 +1511,81 @@ export class LcmContextEngine implements ContextEngine {
           ? Math.floor(params.tokenBudget)
           : 128_000;
 
+      // Ozempic: pre-assembly pressure loop.
+      // If context is above pressure threshold, run compaction passes before
+      // assembling so we don't walk into a context that's already over budget.
+      let pressurePassesRun = 0;
+      if (this.config.pressureLoop) {
+        const maxPasses = Math.max(1, this.config.pressureMaxPasses ?? 3);
+        try {
+          for (let pass = 0; pass < maxPasses; pass++) {
+            const decision = await this.compaction.evaluate(
+              conversation.conversationId,
+              tokenBudget,
+            );
+            if (!decision.shouldCompact) break;
+            const summarize = await this.resolveSummarize({});
+            await this.compaction.compactLeaf({
+              conversationId: conversation.conversationId,
+              tokenBudget,
+              summarize,
+            });
+            pressurePassesRun++;
+          }
+        } catch {
+          // Pressure loop is best-effort — never abort assembly.
+        }
+      }
+
+      const contextPolicy = this.loadPolicyForSession(params.sessionId);
+
+      // Ozempic Tier 3: load and render session state block if configured.
+      // Its tokens are subtracted from the budget before assembly so the
+      // assembler doesn't need to know about the cap.
+      let sessionStateBlock: string | undefined;
+      let effectiveTokenBudget = tokenBudget;
+      const ssConfig = contextPolicy?.sessionState;
+      if (ssConfig?.enabled) {
+        try {
+          const agentId =
+            this.deps.normalizeAgentId?.(
+              this.deps.parseAgentSessionKey?.(params.sessionId)?.agentId,
+            ) ?? "main";
+          const db = getLcmConnection(this.config.databasePath);
+          const ssRecord = loadSessionState(db, params.sessionId, agentId);
+          if (ssRecord) {
+            const block = renderSessionStateBlock(ssRecord, ssConfig, this.timezone);
+            const blockTokens = Math.min(
+              estimateSessionStateTokens(block),
+              ssConfig.maxTokens,
+            );
+            // Only inject if there's something meaningful beyond the header.
+            // The header's "raw messages take precedence if newer" hint handles
+            // staleness automatically — no wall-clock gating needed.
+            if (block.trim().length > "[Session State".length + 60) {
+              sessionStateBlock = block;
+              effectiveTokenBudget = Math.max(1000, tokenBudget - blockTokens);
+            }
+          }
+        } catch {
+          // Session state injection is best-effort — never abort assembly.
+        }
+      }
+
       const assembled = await this.assembler.assemble({
         conversationId: conversation.conversationId,
-        tokenBudget,
+        tokenBudget: effectiveTokenBudget,
         freshTailCount: this.config.freshTailCount,
+        freshTailTrimUnderPressure: this.config.freshTailTrimUnderPressure,
+        provenanceTyping: this.config.provenanceTyping,
+        provenanceEviction: this.config.provenanceEviction,
+        summaryMode: this.config.summaryMode,
+        toolResultCap: this.config.toolResultCap,
+        reasoningTraceMode: this.config.reasoningTraceMode,
+        ackPruning: this.config.ackPruning,
+        ackPruningMaxTokens: this.config.ackPruningMaxTokens,
+        contextPolicy,
+        sessionStateBlock,
       });
 
       // If assembly produced no messages for a non-empty live session,
@@ -1355,6 +1595,45 @@ export class LcmContextEngine implements ContextEngine {
           messages: params.messages,
           estimatedTokens: 0,
         };
+      }
+
+      // Ozempic: emit context manifest when provenance typing is enabled.
+      if (this.config.provenanceTyping && assembled.manifestItems) {
+        const ozempicFeatures: OzempicFeatureFlags = {
+          pressureLoop: this.config.pressureLoop,
+          freshTailTrimUnderPressure: this.config.freshTailTrimUnderPressure,
+          provenanceTyping: this.config.provenanceTyping,
+          provenanceEviction: this.config.provenanceEviction,
+          summaryMode: this.config.summaryMode,
+          toolResultCap: this.config.toolResultCap,
+          reasoningTraceMode: this.config.reasoningTraceMode,
+          ackPruning: this.config.ackPruning,
+        };
+        const manifest: ContextManifest = {
+          version: 1,
+          manifestId: randomUUID(),
+          sessionId: params.sessionId,
+          assembledAt: new Date().toISOString(),
+          tokenBudget,
+          estimatedTokens: assembled.estimatedTokens,
+          freshTailCount: this.config.freshTailCount,
+          ozempicFeatures,
+          stats: {
+            totalResolvedItems: assembled.stats.totalContextItems,
+            selectedItems: assembled.manifestItems.length,
+            omittedItems: assembled.stats.totalContextItems - assembled.manifestItems.length,
+            selectedRawMessages: assembled.stats.rawMessageCount,
+            selectedSummaries: assembled.stats.summaryCount,
+            totalContextItems: assembled.stats.totalContextItems,
+            freshTailTrimmed: assembled.stats.freshTailTrimmed,
+            evictedStaleObserved: assembled.stats.evictedStaleObserved,
+            pressurePassesRun,
+            ackPruned: assembled.stats.ackPruned,
+          },
+          items: assembled.manifestItems,
+        };
+        // Fire-and-forget — manifest write must not block or crash assembly.
+        void writeContextManifest(manifest, defaultManifestDir());
       }
 
       const result: AssembleResultWithSystemPrompt = {

@@ -710,7 +710,7 @@ export class CompactionEngine {
           item.itemType === "summary" &&
           typeof item.summaryId === "string",
       )
-      .slice(-2);
+      .slice(-1);
 
     if (priorSummaryItems.length === 0) {
       return undefined;

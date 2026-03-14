@@ -7,6 +7,7 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
 - [What it does](#what-it-does)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
+- [Ozempic — Context Management Layer](#ozempic--context-management-layer)
 - [Documentation](#documentation)
 - [Development](#development)
 - [License](#license)
@@ -181,12 +182,241 @@ For most long-lived LCM setups, a good starting point is:
 
 ## Documentation
 
+- [Ozempic — Context Management Layer](#ozempic--context-management-layer)
 - [Configuration guide](docs/configuration.md)
 - [Architecture](docs/architecture.md)
 - [Agent tools](docs/agent-tools.md)
 - [TUI Reference](docs/tui.md)
 - [lcm-tui](tui/README.md)
 - [Optional: enable FTS5 for fast full-text search](docs/fts5.md)
+
+## Ozempic — Context Management Layer
+
+Ozempic is a set of context management features built into lossless-claw. Its job is to give locally-run, small-context-window language models a fighting chance at long-lived, tool-heavy agent sessions. The design goal is an agent that never needs `/new` or manual session reset, has a small organized context containing only what it needs for the current turn, and can recall historical context from the DAG on demand.
+
+All features are independently toggleable. Sensible defaults work for any agent without configuration.
+
+### Tier 1 — Engine features
+
+Core context management mechanics. Always beneficial. Configured in `plugins.entries.lossless-claw.config`.
+
+| Feature | Config key | Default | Description |
+|---------|-----------|---------|-------------|
+| Pre-assembly pressure loop | `pressureLoop` | `true` | Runs compaction passes before assembly when context exceeds budget, rather than discovering the problem after |
+| Pressure max passes | `pressureMaxPasses` | `3` | Maximum compaction passes in the pressure loop |
+| Fresh tail trimming | `freshTailTrimUnderPressure` | `true` | Trims oldest fresh-tail messages instead of overflowing when the tail alone exceeds the token budget |
+| Provenance typing | `provenanceTyping` | `true` | Classifies tool results as `observed`, `computed`, or `mutation` based on tool name and content |
+| Provenance-aware eviction | `provenanceEviction` | `true` | Evicts stale `observed` results after a `mutation` to the same resource |
+
+### Tier 2 — Heuristic features
+
+Domain-agnostic heuristics that improve context quality. Configured in `plugins.entries.lossless-claw.config`.
+
+| Feature | Config key | Default | Description |
+|---------|-----------|---------|-------------|
+| Acknowledgment pruning | `ackPruning` | `false` | Removes low-value conversational exchanges ("ok thanks" / "You're welcome!") from assembled context |
+| Ack pruning threshold | `ackPruningMaxTokens` | `30` | Messages under this token count with no tool calls are ack candidates |
+| Summary inclusion mode | `summaryMode` | `"auto"` | `"always"` = include summaries, `"on-demand"` = exclude (use recall tools), `"auto"` = include when under 50% budget |
+| Tool result size cap | `toolResultCap` | `400` | Truncates individual tool results exceeding this token count. `0` = unlimited |
+| Reasoning trace handling | `reasoningTraceMode` | `"drop"` | `"drop"` = remove previous-turn reasoning traces, `"keep"` = preserve them |
+
+### Tier 3 — Agent-specific policies
+
+Powerful features that require per-agent configuration. Defined in `context-policy.json` in the agent's workspace directory (e.g., `~/.openclaw/workspace-timetrack/context-policy.json`). All off by default.
+
+#### Tool result compaction rules
+
+Extract specific fields from tool results instead of blind truncation. For example, keep only `day`, `start`, `end`, and `total` from a spreadsheet read:
+
+```json
+{
+  "toolResultCompaction": {
+    "rules": [
+      {
+        "toolNamePattern": "sheets_cli.py.*read",
+        "extractFields": ["day", "start", "end", "total"],
+        "maxTokens": 150
+      }
+    ]
+  }
+}
+```
+
+#### Custom tool classification
+
+Override the heuristic provenance classifier with explicit tool-to-provenance mappings:
+
+```json
+{
+  "toolClassification": {
+    "observed": ["read-day", "read-week", "metadata"],
+    "computed": ["calc", "aggregate-days"],
+    "mutation": ["write-row", "set-day-shift"]
+  }
+}
+```
+
+#### Freshness TTL
+
+Time-based eviction for `observed` results, even without a subsequent `mutation`:
+
+```json
+{
+  "freshnessTtl": {
+    "default": 300,
+    "byTool": { "get-quote": 30, "read-day": 300 }
+  }
+}
+```
+
+#### Session state document
+
+A small structured working memory document updated after mutation-provenance turns and injected into the assembled context. Provides the model with a concise, always-current snapshot of domain state — replacing hundreds of tokens of summary archaeology with 50–200 tokens of structured truth.
+
+**What the model sees in context:**
+
+```
+[Session State]
+Active sheet: March 2026
+PTO balance: 7.5 hours
+Last operation: updated March 24 to 8:30 AM - 3:00 PM
+Known anomalies: day 24 appears twice (rows 23 and 31)
+Notes: User prefers 24-hour time format
+
+[Recent Activity]  — lcm_grep("<timestamp or keyword>") for full context
+2:30 PM — Updated March 24 clock-out to 3:00 PM
+2:15 PM — Read March 23 (8:30 AM - 5:00 PM, confirmed correct)
+1:50 PM — Updated PTO balance from 8.0 to 7.5 hours
+```
+
+The activity log timestamps match the format used in DAG summaries (same timezone), so the model can cross-reference entries with summaries and use `lcm_grep` to drill into any entry for full detail. This turns the activity log into a temporal index — the model scans the log, decides if the one-liner is enough context, and only calls recall tools when it needs depth.
+
+**Configuration:**
+
+```json
+{
+  "sessionState": {
+    "enabled": true,
+    "maxTokens": 300,
+    "format": "hybrid",
+    "updateOn": "mutation",
+    "schema": {
+      "fields": [
+        {"name": "activeSheet", "label": "Active sheet"},
+        {"name": "ptoBalance", "label": "PTO balance"},
+        {"name": "lastOperation", "label": "Last operation"},
+        {"name": "knownAnomalies", "label": "Known anomalies"}
+      ]
+    },
+    "activityLog": {
+      "enabled": true,
+      "maxEntries": 10,
+      "recallHint": true
+    }
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable session state |
+| `maxTokens` | integer | `300` | Hard cap on state doc tokens; subtracted from assembly budget |
+| `format` | string | `"hybrid"` | `"structured"` = named fields only, `"hybrid"` = named fields + freeform `_notes` |
+| `updateOn` | string | `"mutation"` | `"mutation"` = update after mutations only, `"any-tool"` = update after any tool call |
+| `schema.fields` | array | `[]` | Field definitions: `name` (JSON key), `label` (rendered in context), optional `description` (hint to update model about what belongs in the field) |
+| `activityLog.enabled` | boolean | `true` | Rolling activity log with timestamps |
+| `activityLog.maxEntries` | integer | `10` | Max log entries before oldest rolls off |
+| `activityLog.recallHint` | boolean | `true` | Add `lcm_grep(...)` hint in log header |
+| `model` | string | *(summaryModel)* | Dedicated model for session state updates — separates it from compaction on the same model |
+| `provider` | string | *(summaryProvider)* | Provider for the dedicated session state model |
+| `thinkingEnabled` | boolean | `false` | Enable extended thinking for the session state model (recommended for small models doing complex field extraction) |
+
+The state document is persisted to the LCM SQLite database and survives gateway restarts. Updates are fail-open — if the summary model returns garbage, the previous state is kept.
+
+### Model tuning recommendations
+
+Three-model setup (main inference + compaction + session state):
+
+| Model role | Recommended settings | Why |
+|------------|---------------------|-----|
+| **Main inference** (27B+) | `temperature: 0.6`, `top_p: 0.95`, `min_p: 0.05` | Thinking handles structured reasoning; slight temperature keeps responses natural |
+| **Compaction/summarization** (9B) | `temperature: 0`, `top_p: 1.0`, thinking off | Summaries should be deterministic and faithful — zero temperature, no creativity |
+| **Session state** (4B) | `temperature: 0.5` with thinking on, or `temperature: 0` without | Thinking benefits from exploration; the strict JSON prompt constrains the output regardless |
+
+With thinking enabled on the session state model (`"thinkingEnabled": true` in context-policy.json), lossless-claw automatically uses `temperature: 0.5` for that call. All other model parameters (`top_p`, `min_p`, `repetition_penalty`) are controlled by your provider's server configuration.
+
+### Context manifests
+
+On every assembly, Ozempic writes a manifest file recording exactly what went into the model prompt. Manifests are written to `~/.openclaw/aeon/manifests/<sessionId>.latest.json` and include provenance metadata, Ozempic feature flags, and assembly statistics. They are a forensic/debugging tool — the model never sees them.
+
+### Configuration example
+
+A complete Ozempic configuration for a timetrack agent:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "lossless-claw": {
+        "config": {
+          "freshTailCount": 8,
+          "contextThreshold": 0.40,
+          "pressureLoop": true,
+          "pressureMaxPasses": 3,
+          "freshTailTrimUnderPressure": true,
+          "provenanceTyping": true,
+          "provenanceEviction": true,
+          "summaryMode": "auto",
+          "toolResultCap": 400,
+          "reasoningTraceMode": "drop",
+          "ackPruning": false,
+          "ackPruningMaxTokens": 30
+        }
+      }
+    }
+  }
+}
+```
+
+With a per-agent policy in `~/.openclaw/workspace-timetrack/context-policy.json`:
+
+```json
+{
+  "overrides": {
+    "summaryMode": "on-demand",
+    "toolResultCap": 200,
+    "ackPruning": true
+  },
+  "sessionState": {
+    "enabled": true,
+    "maxTokens": 300,
+    "format": "hybrid",
+    "updateOn": "mutation",
+    "schema": {
+      "fields": [
+        {"name": "activeSheet", "label": "Active sheet"},
+        {"name": "ptoBalance", "label": "PTO balance"},
+        {"name": "lastOperation", "label": "Last operation"},
+        {"name": "knownAnomalies", "label": "Known anomalies"}
+      ]
+    },
+    "activityLog": {
+      "enabled": true,
+      "maxEntries": 10,
+      "recallHint": true
+    }
+  },
+  "toolClassification": {
+    "observed": ["read-day", "read-week", "metadata"],
+    "mutation": ["write-row", "set-day-shift"]
+  },
+  "freshnessTtl": {
+    "default": 300
+  }
+}
+```
+
+For the full design document, see [Ozempic v2 plan](../ozempic_v2_plan.md).
 
 ## Development
 
@@ -210,6 +440,9 @@ src/
   assembler.ts              # Context assembly (summaries + messages → model context)
   compaction.ts             # CompactionEngine — leaf passes, condensation, sweeps
   summarize.ts              # Depth-aware prompt generation and LLM summarization
+  context-manifest.ts       # Provenance types, manifest schema, and file writer
+  context-policy.ts         # Per-agent policy loader and Tier 3 feature logic
+  session-state.ts          # Session state persistence and update logic
   retrieval.ts              # RetrievalEngine — grep, describe, expand operations
   expansion.ts              # DAG expansion logic for lcm_expand_query
   expansion-auth.ts         # Delegation grants for sub-agent expansion

@@ -35,6 +35,7 @@ export type CompleteFn = (params: {
   maxTokens: number;
   temperature?: number;
   reasoning?: string;
+  extraBody?: Record<string, unknown>;
 }) => Promise<CompletionResult>;
 
 /**

@@ -24,6 +24,32 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
+  // ── Ozempic — Tier 1 engine features ────────────────────────────────────────
+  /** Run a compaction pass before assembly when context is above pressure threshold. */
+  pressureLoop: boolean;
+  /** Maximum compaction passes to run in the pre-assembly pressure loop. */
+  pressureMaxPasses: number;
+  /** Trim oldest fresh-tail items instead of overflowing when fresh tail exceeds budget. */
+  freshTailTrimUnderPressure: boolean;
+  /** Classify tool results by provenance kind (observed / computed / mutation). */
+  provenanceTyping: boolean;
+  /** Evict stale observed results after a mutation to the same tool. */
+  provenanceEviction: boolean;
+  // ── Ozempic — Tier 2 heuristic features ─────────────────────────────────────
+  /** Summary inclusion strategy: "always" | "on-demand" | "auto". */
+  summaryMode: "always" | "on-demand" | "auto";
+  /** Max tokens per tool result in assembled context. 0 = unlimited. */
+  toolResultCap: number;
+  /** How to handle previous-turn reasoning traces: "keep" | "drop". */
+  reasoningTraceMode: "keep" | "drop";
+  /** Remove low-value acknowledgment exchanges from assembled context. */
+  ackPruning: boolean;
+  /** Messages under this token count with no tool calls are ack candidates. */
+  ackPruningMaxTokens: number;
+  /** When false, passes chat_template_kwargs.enable_thinking=false to the summary model. Default: false. */
+  summaryModelThinking: boolean;
+  /** When set, write a JSONL debug entry for every summary model call (request + response) to this path. */
+  summaryDebugLog: string;
 };
 
 /** Safely coerce an unknown value to a finite number, or return undefined. */
@@ -123,5 +149,52 @@ export function resolveLcmConfig(
       env.LCM_PRUNE_HEARTBEAT_OK !== undefined
         ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
         : toBool(pc.pruneHeartbeatOk) ?? false,
+    // ── Ozempic — Tier 1 engine features ──────────────────────────────────────
+    pressureLoop:
+      env.LCM_PRESSURE_LOOP !== undefined
+        ? env.LCM_PRESSURE_LOOP !== "false"
+        : toBool(pc.pressureLoop) ?? true,
+    pressureMaxPasses:
+      (env.LCM_PRESSURE_MAX_PASSES !== undefined
+        ? parseInt(env.LCM_PRESSURE_MAX_PASSES, 10)
+        : undefined) ?? toNumber(pc.pressureMaxPasses) ?? 3,
+    freshTailTrimUnderPressure:
+      env.LCM_FRESH_TAIL_TRIM_UNDER_PRESSURE !== undefined
+        ? env.LCM_FRESH_TAIL_TRIM_UNDER_PRESSURE !== "false"
+        : toBool(pc.freshTailTrimUnderPressure) ?? true,
+    provenanceTyping:
+      env.LCM_PROVENANCE_TYPING !== undefined
+        ? env.LCM_PROVENANCE_TYPING !== "false"
+        : toBool(pc.provenanceTyping) ?? true,
+    provenanceEviction:
+      env.LCM_PROVENANCE_EVICTION !== undefined
+        ? env.LCM_PROVENANCE_EVICTION !== "false"
+        : toBool(pc.provenanceEviction) ?? true,
+    // ── Ozempic — Tier 2 heuristic features ───────────────────────────────────
+    summaryMode:
+      (env.LCM_SUMMARY_MODE as "always" | "on-demand" | "auto" | undefined) ??
+      (toStr(pc.summaryMode) as "always" | "on-demand" | "auto" | undefined) ??
+      "auto",
+    toolResultCap:
+      (env.LCM_TOOL_RESULT_CAP !== undefined ? parseInt(env.LCM_TOOL_RESULT_CAP, 10) : undefined) ??
+      toNumber(pc.toolResultCap) ?? 400,
+    reasoningTraceMode:
+      (env.LCM_REASONING_TRACE_MODE as "keep" | "drop" | undefined) ??
+      (toStr(pc.reasoningTraceMode) as "keep" | "drop" | undefined) ??
+      "drop",
+    ackPruning:
+      env.LCM_ACK_PRUNING !== undefined
+        ? env.LCM_ACK_PRUNING === "true"
+        : toBool(pc.ackPruning) ?? false,
+    ackPruningMaxTokens:
+      (env.LCM_ACK_PRUNING_MAX_TOKENS !== undefined
+        ? parseInt(env.LCM_ACK_PRUNING_MAX_TOKENS, 10)
+        : undefined) ?? toNumber(pc.ackPruningMaxTokens) ?? 30,
+    summaryModelThinking:
+      env.LCM_SUMMARY_MODEL_THINKING !== undefined
+        ? env.LCM_SUMMARY_MODEL_THINKING === "true"
+        : toBool(pc.summaryModelThinking) ?? false,
+    summaryDebugLog:
+      env.LCM_SUMMARY_DEBUG_LOG?.trim() ?? toStr(pc.summaryDebugLog) ?? "",
   };
 }

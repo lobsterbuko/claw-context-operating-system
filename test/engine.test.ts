@@ -33,6 +33,18 @@ function createTestConfig(databasePath: string): LcmConfig {
     autocompactDisabled: false,
     timezone: "UTC",
     pruneHeartbeatOk: false,
+    pressureLoop: false,
+    pressureMaxPasses: 3,
+    freshTailTrimUnderPressure: false,
+    provenanceTyping: false,
+    provenanceEviction: false,
+    summaryMode: "auto",
+    toolResultCap: 0,
+    reasoningTraceMode: "drop",
+    ackPruning: false,
+    ackPruningMaxTokens: 30,
+    summaryModelThinking: false,
+    summaryDebugLog: "",
   };
 }
 

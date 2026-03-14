@@ -70,6 +70,63 @@
       },
       "summaryProvider": {
         "type": "string"
+      },
+      "leafChunkTokens": {
+        "type": "integer",
+        "minimum": 100
+      },
+      "leafTargetTokens": {
+        "type": "integer",
+        "minimum": 100
+      },
+      "condensedTargetTokens": {
+        "type": "integer",
+        "minimum": 100
+      },
+      "pruneHeartbeatOk": {
+        "type": "boolean"
+      },
+      "pressureLoop": {
+        "type": "boolean"
+      },
+      "pressureMaxPasses": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10
+      },
+      "freshTailTrimUnderPressure": {
+        "type": "boolean"
+      },
+      "provenanceTyping": {
+        "type": "boolean"
+      },
+      "provenanceEviction": {
+        "type": "boolean"
+      },
+      "summaryMode": {
+        "type": "string",
+        "enum": ["always", "on-demand", "auto"]
+      },
+      "toolResultCap": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "reasoningTraceMode": {
+        "type": "string",
+        "enum": ["keep", "drop"]
+      },
+      "ackPruning": {
+        "type": "boolean"
+      },
+      "ackPruningMaxTokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "summaryModelThinking": {
+        "type": "boolean"
+      },
+      "summaryDebugLog": {
+        "type": "string"
       }
     }
   }

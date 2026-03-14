@@ -1,5 +1,12 @@
 import type { ContextEngine } from "openclaw/plugin-sdk";
 import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
+import { classifyToolProvenance, type ManifestItem, type ProvenanceKind } from "./context-manifest.js";
+import {
+  applyCompactionRules,
+  isFreshnessExpired,
+  resolveToolProvenanceWithPolicy,
+  type ContextPolicy,
+} from "./context-policy.js";
 import type {
   ConversationStore,
   MessagePartRecord,
@@ -16,6 +23,32 @@ export interface AssembleContextInput {
   tokenBudget: number;
   /** Number of most recent raw turns to always include (default: 8) */
   freshTailCount?: number;
+  // ── Ozempic Tier 1 feature flags ─────────────────────────────────────────────
+  /** Trim oldest fresh-tail items instead of overflowing when fresh tail exceeds budget. */
+  freshTailTrimUnderPressure?: boolean;
+  /** Classify tool results by provenance kind and attach metadata for manifest building. */
+  provenanceTyping?: boolean;
+  /** Evict stale observed results when a mutation from the same tool is present. */
+  provenanceEviction?: boolean;
+  // ── Ozempic Tier 2 heuristic flags ───────────────────────────────────────────
+  /** Summary inclusion strategy: "always" | "on-demand" | "auto". */
+  summaryMode?: "always" | "on-demand" | "auto";
+  /** Max tokens per tool result; 0 = unlimited. */
+  toolResultCap?: number;
+  /** How to handle previous-turn reasoning traces: "keep" | "drop". */
+  reasoningTraceMode?: "keep" | "drop";
+  /** Remove low-value acknowledgment exchanges from the evictable pool. */
+  ackPruning?: boolean;
+  /** Token threshold for acknowledgment candidate detection. */
+  ackPruningMaxTokens?: number;
+  // ── Ozempic Tier 3 agent-specific policy ─────────────────────────────────────
+  /** Per-agent context policy (loaded from workspace context-policy.json). */
+  contextPolicy?: ContextPolicy | null;
+  /**
+   * Pre-rendered session state block to inject as the first message.
+   * Token cost has already been subtracted from tokenBudget by the engine.
+   */
+  sessionStateBlock?: string;
 }
 
 export interface AssembleContextResult {
@@ -30,7 +63,15 @@ export interface AssembleContextResult {
     rawMessageCount: number;
     summaryCount: number;
     totalContextItems: number;
+    /** Number of fresh-tail items trimmed under budget pressure (Ozempic). */
+    freshTailTrimmed: number;
+    /** Number of stale observed items evicted after a mutation (Ozempic). */
+    evictedStaleObserved: number;
+    /** Number of acknowledgment messages pruned from the evictable pool (Ozempic). */
+    ackPruned: number;
   };
+  /** Populated when provenanceTyping is enabled. Used by engine to build context manifest. */
+  manifestItems?: ManifestItem[];
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -38,6 +79,24 @@ export interface AssembleContextResult {
 /** Simple token estimate: ~4 chars per token, same as VoltCode's Token.estimate */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+/** Returns true if the message contains tool-call or tool-result content. */
+function hasToolContent(message: AgentMessage): boolean {
+  if (message.role === "toolResult") return true;
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) return false;
+  return content.some((block: unknown) => {
+    if (!block || typeof block !== "object") return false;
+    const b = block as { type?: string };
+    return (
+      b.type === "tool_use" ||
+      b.type === "toolUse" ||
+      b.type === "tool-use" ||
+      b.type === "function_call" ||
+      b.type === "functionCall"
+    );
+  });
 }
 
 type SummaryPromptSignal = Pick<SummaryRecord, "kind" | "depth" | "descendantCount">;
@@ -539,6 +598,14 @@ interface ResolvedItem {
   tokens: number;
   /** Whether this came from a raw message (vs. a summary) */
   isMessage: boolean;
+  /** DB role of the underlying message (Ozempic provenance). */
+  dbRole?: string;
+  /** Tool name, populated for tool-result messages (Ozempic provenance). */
+  toolName?: string;
+  /** Classified provenance kind (Ozempic). */
+  provenance?: ProvenanceKind;
+  /** Message creation timestamp, used for freshness TTL eviction (Ozempic Tier 3). */
+  createdAt?: Date;
   /** Summary metadata used for dynamic system prompt guidance */
   summarySignal?: SummaryPromptSignal;
 }
@@ -565,6 +632,15 @@ export class ContextAssembler {
   async assemble(input: AssembleContextInput): Promise<AssembleContextResult> {
     const { conversationId, tokenBudget } = input;
     const freshTailCount = input.freshTailCount ?? 8;
+    const freshTailTrimUnderPressure = input.freshTailTrimUnderPressure ?? false;
+    const provenanceTyping = input.provenanceTyping ?? false;
+    const provenanceEviction = input.provenanceEviction ?? false;
+    const summaryMode = input.summaryMode ?? "auto";
+    const toolResultCap = input.toolResultCap ?? 0;
+    const reasoningTraceMode = input.reasoningTraceMode ?? "keep";
+    const ackPruning = input.ackPruning ?? false;
+    const ackPruningMaxTokens = input.ackPruningMaxTokens ?? 30;
+    const contextPolicy = input.contextPolicy ?? null;
 
     // Step 1: Get all context items ordered by ordinal
     const contextItems = await this.summaryStore.getContextItems(conversationId);
@@ -573,12 +649,44 @@ export class ContextAssembler {
       return {
         messages: [],
         estimatedTokens: 0,
-        stats: { rawMessageCount: 0, summaryCount: 0, totalContextItems: 0 },
+        stats: { rawMessageCount: 0, summaryCount: 0, totalContextItems: 0, freshTailTrimmed: 0, evictedStaleObserved: 0, ackPruned: 0 },
       };
     }
 
     // Step 2: Resolve each context item into a ResolvedItem
-    const resolved = await this.resolveItems(contextItems);
+    let resolved = await this.resolveItems(contextItems);
+
+    // Ozempic: classify provenance on all resolved items
+    if (provenanceTyping) {
+      for (const item of resolved) {
+        if (item.dbRole === "tool" && item.toolName) {
+          // Tier 3: use policy-aware classifier (falls back to default heuristics)
+          item.provenance = resolveToolProvenanceWithPolicy(item.toolName, contextPolicy);
+        } else if (item.dbRole === "user") {
+          item.provenance = "user_prompt";
+        } else if (item.dbRole === "assistant") {
+          item.provenance = "assistant_answer";
+        } else if (!item.isMessage) {
+          item.provenance = "summary";
+        }
+      }
+    }
+
+    // Ozempic: summary mode filter
+    // "on-demand" — never include summaries; agent fetches via LCM tools as needed.
+    // "auto"       — skip summaries when all raw messages already fit in budget
+    //                (they waste tokens when there's no pressure).
+    // "always"     — include summaries (default behaviour, no filter).
+    if (summaryMode === "on-demand") {
+      resolved = resolved.filter((item) => item.isMessage);
+    } else if (summaryMode === "auto") {
+      const rawOnlyTokens = resolved.reduce((sum, item) => sum + (item.isMessage ? item.tokens : 0), 0);
+      if (rawOnlyTokens <= tokenBudget) {
+        // Everything fits without summaries — leave them out to keep context clean.
+        resolved = resolved.filter((item) => item.isMessage);
+      }
+      // If over budget, summaries provide coverage for dropped raw messages — keep them.
+    }
 
     // Count stats from the full (pre-truncation) set
     let rawMessageCount = 0;
@@ -599,7 +707,7 @@ export class ContextAssembler {
 
     // Step 3: Split into evictable prefix and protected fresh tail
     const tailStart = Math.max(0, resolved.length - freshTailCount);
-    const freshTail = resolved.slice(tailStart);
+    let freshTail = resolved.slice(tailStart);
     const evictable = resolved.slice(0, tailStart);
 
     // Step 4: Budget-aware selection
@@ -609,11 +717,29 @@ export class ContextAssembler {
       tailTokens += item.tokens;
     }
 
+    // Ozempic: fresh tail trimming under pressure.
+    // If fresh tail alone exceeds budget, trim from the oldest end
+    // rather than overflowing (preserves the newest items).
+    let freshTailTrimmed = 0;
+    if (freshTailTrimUnderPressure && tailTokens > tokenBudget && freshTail.length > 1) {
+      let trimIdx = 0;
+      let runningTokens = tailTokens;
+      while (runningTokens > tokenBudget && trimIdx < freshTail.length - 1) {
+        runningTokens -= freshTail[trimIdx].tokens;
+        trimIdx++;
+        freshTailTrimmed++;
+      }
+      if (trimIdx > 0) {
+        freshTail = freshTail.slice(trimIdx);
+        tailTokens = runningTokens;
+      }
+    }
+
     // Fill remaining budget from evictable items, oldest first.
     // If the fresh tail alone exceeds the budget we still include it
     // (we never drop fresh items), but we skip all evictable items.
     const remainingBudget = Math.max(0, tokenBudget - tailTokens);
-    const selected: ResolvedItem[] = [];
+    let selected: ResolvedItem[] = [];
     let evictableTokens = 0;
 
     // Walk evictable items from oldest to newest. We want to keep as many
@@ -647,6 +773,74 @@ export class ContextAssembler {
       evictableTokens = accum;
     }
 
+    // Ozempic: provenance-aware eviction.
+    // Find tool names that produced mutations in the fresh tail.
+    // Evict older observed results from the same tools (they are stale).
+    let evictedStaleObserved = 0;
+    if (provenanceEviction && provenanceTyping) {
+      const mutatedTools = new Set<string>();
+      for (const item of freshTail) {
+        if (item.provenance === "mutation" && item.toolName) {
+          mutatedTools.add(item.toolName);
+        }
+      }
+      if (mutatedTools.size > 0) {
+        const beforeEviction = selected.length;
+        selected = selected.filter((item) => {
+          if (item.provenance === "observed" && item.toolName && mutatedTools.has(item.toolName)) {
+            evictedStaleObserved++;
+            evictableTokens -= item.tokens;
+            return false;
+          }
+          return true;
+        });
+        evictedStaleObserved = beforeEviction - selected.length;
+      }
+    }
+
+    // Ozempic Tier 3: freshness TTL eviction.
+    // Evict observed results from the evictable pool that are past their TTL.
+    // Items in the fresh tail are always preserved regardless of TTL.
+    if (contextPolicy?.freshnessTtl && provenanceTyping) {
+      selected = selected.filter((item) => {
+        if (
+          item.provenance === "observed" &&
+          isFreshnessExpired(item.createdAt, item.toolName, contextPolicy)
+        ) {
+          evictableTokens -= item.tokens;
+          return false;
+        }
+        return true;
+      });
+    }
+
+    // Ozempic: acknowledgment pruning.
+    // Scan the evictable portion for low-value (user, assistant) pairs:
+    // tiny assistant messages with no tool calls (e.g. "Sure!", "Got it.").
+    // Removing them frees budget for real content without losing signal.
+    let ackPruned = 0;
+    if (ackPruning && selected.length > 1) {
+      const ackIndices = new Set<number>();
+      for (let i = 1; i < selected.length; i++) {
+        const prev = selected[i - 1];
+        const curr = selected[i];
+        if (
+          curr.dbRole === "assistant" &&
+          !hasToolContent(curr.message) &&
+          curr.tokens <= ackPruningMaxTokens &&
+          prev.dbRole === "user" &&
+          !hasToolContent(prev.message)
+        ) {
+          ackIndices.add(i - 1);
+          ackIndices.add(i);
+        }
+      }
+      if (ackIndices.size > 0) {
+        selected = selected.filter((_, idx) => !ackIndices.has(idx));
+        ackPruned = ackIndices.size;
+      }
+    }
+
     // Append fresh tail after the evictable prefix
     selected.push(...freshTail);
 
@@ -665,15 +859,94 @@ export class ContextAssembler {
       }
     }
 
+    // Ozempic: reasoning trace drop.
+    // Strip thinking/reasoning blocks from non-fresh-tail assistant messages
+    // to reclaim tokens wasted on prior-turn deliberation.
+    if (reasoningTraceMode === "drop") {
+      for (let i = 0; i < rawMessages.length; i++) {
+        const msg = rawMessages[i];
+        if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+          const filtered = (msg.content as Array<{ type?: string }>).filter(
+            (block) => block.type !== "thinking" && block.type !== "reasoning",
+          );
+          if (filtered.length !== (msg.content as unknown[]).length) {
+            rawMessages[i] = { ...msg, content: filtered as typeof msg.content } as typeof msg;
+          }
+        }
+      }
+    }
+
+    // Ozempic: tool result compaction (Tier 3 rules + Tier 2 cap fallback).
+    // Tier 3 compaction rules take priority: field extraction + per-rule maxTokens.
+    // Falls back to Tier 2 toolResultCap truncation when no rule matches.
+    // Runs whenever either Tier 2 cap is set OR Tier 3 rules are present.
+    const hasCompactionRules = (contextPolicy?.toolResultCompaction?.rules?.length ?? 0) > 0;
+    if (toolResultCap > 0 || hasCompactionRules) {
+      for (let i = 0; i < rawMessages.length; i++) {
+        const msg = rawMessages[i];
+        if (msg?.role === "toolResult" && Array.isArray(msg.content)) {
+          const toolName = (msg as { toolName?: string }).toolName ?? "";
+          const capped = (msg.content as Array<unknown>).map((block) => {
+            if (!block || typeof block !== "object") return block;
+            const b = block as { type?: string; output?: unknown; text?: string };
+            const text =
+              typeof b.output === "string"
+                ? b.output
+                : typeof b.text === "string"
+                  ? b.text
+                  : null;
+            if (text === null) return block;
+            const compacted = applyCompactionRules(toolName, text, contextPolicy, toolResultCap);
+            if (compacted === text) return block;
+            if (typeof b.output === "string") return { ...b, output: compacted };
+            return { ...b, text: compacted };
+          });
+          rawMessages[i] = { ...msg, content: capped as typeof msg.content } as typeof msg;
+        }
+      }
+    }
+
+    // Ozempic: build manifest items when provenance typing is enabled
+    let manifestItems: ManifestItem[] | undefined;
+    if (provenanceTyping) {
+      const freshTailOrdinals = new Set(freshTail.map((it) => it.ordinal));
+      manifestItems = selected.map((item): ManifestItem => ({
+        ordinal: item.ordinal,
+        sourceType: item.isMessage ? "message" : "summary",
+        runtimeRole: item.message.role,
+        estimatedTokens: item.tokens,
+        provenance: item.provenance
+          ? { kind: item.provenance, ...(item.toolName ? { toolName: item.toolName } : {}) }
+          : undefined,
+        protectedByFreshTail: freshTailOrdinals.has(item.ordinal),
+      }));
+    }
+
+    let sanitized = sanitizeToolUseResultPairing(rawMessages) as AgentMessage[];
+
+    // Ozempic Tier 3: inject session state block as the first message.
+    // Prepended after all assembly/pruning so it is never itself pruned.
+    const { sessionStateBlock } = input;
+    if (sessionStateBlock && sessionStateBlock.trim()) {
+      sanitized = [
+        { role: "user", content: sessionStateBlock } as AgentMessage,
+        ...sanitized,
+      ];
+    }
+
     return {
-      messages: sanitizeToolUseResultPairing(rawMessages) as AgentMessage[],
+      messages: sanitized,
       estimatedTokens,
       systemPromptAddition,
       stats: {
         rawMessageCount,
         summaryCount,
         totalContextItems: resolved.length,
+        freshTailTrimmed,
+        evictedStaleObserved,
+        ackPruned,
       },
+      manifestItems,
     };
   }
 
@@ -772,6 +1045,9 @@ export class ContextAssembler {
             } as AgentMessage),
       tokens: tokenCount,
       isMessage: true,
+      dbRole: msg.role,
+      toolName: toolName ?? undefined,
+      createdAt: msg.createdAt,
     };
   }
 

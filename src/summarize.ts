@@ -1,3 +1,4 @@
+import { appendFileSync } from "fs";
 import type { LcmDependencies } from "./types.js";
 
 export type LcmSummarizeOptions = {
@@ -631,6 +632,15 @@ function buildDeterministicFallbackSummary(text: string, targetTokens: number): 
   return `${trimmed.slice(0, maxChars)}\n[LCM fallback summary; truncated for context management]`;
 }
 
+/** Append one JSONL entry to the summary debug log. Fail-silent. */
+function writeSummaryDebugEntry(logPath: string, entry: Record<string, unknown>): void {
+  try {
+    appendFileSync(logPath, JSON.stringify(entry) + "\n", "utf8");
+  } catch {
+    // best-effort
+  }
+}
+
 /**
  * Builds a model-backed LCM summarize callback from runtime legacy params.
  *
@@ -641,6 +651,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
   deps: LcmDependencies;
   legacyParams: LcmSummarizerLegacyParams;
   customInstructions?: string;
+  summaryModelThinking?: boolean;
 }): Promise<LcmSummarizeFn | undefined> {
   const providerHint =
     typeof params.legacyParams.provider === "string" ? params.legacyParams.provider.trim() : "";
@@ -677,6 +688,17 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     params.deps.config.condensedTargetTokens > 0
       ? params.deps.config.condensedTargetTokens
       : DEFAULT_CONDENSED_TARGET_TOKENS;
+
+  const thinkingEnabled = params.summaryModelThinking ?? false;
+  const extraBody: Record<string, unknown> | undefined = !thinkingEnabled
+    ? { chat_template_kwargs: { enable_thinking: false } }
+    : undefined;
+
+  const debugLogPath =
+    typeof params.deps.config.summaryDebugLog === "string" &&
+    params.deps.config.summaryDebugLog.trim()
+      ? params.deps.config.summaryDebugLog.trim()
+      : "";
 
   return async (
     text: string,
@@ -717,24 +739,55 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           customInstructions: params.customInstructions,
         });
 
-    const result = await params.deps.complete({
-      provider,
-      model,
-      apiKey,
-      providerApi,
-      authProfileId,
-      agentDir,
-      runtimeConfig: params.legacyParams.config,
-      system: LCM_SUMMARIZER_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      maxTokens: targetTokens,
-      temperature: aggressive ? 0.1 : 0.2,
-    });
+    const t0 = Date.now();
+    const SUMMARY_TIMEOUT_MS = 120_000;
+    const result = await Promise.race([
+      params.deps.complete({
+        provider,
+        model,
+        apiKey,
+        providerApi,
+        authProfileId,
+        agentDir,
+        runtimeConfig: params.legacyParams.config,
+        system: LCM_SUMMARIZER_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        maxTokens: targetTokens,
+        temperature: aggressive ? 0.1 : 0.2,
+        extraBody,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`summary model timed out after ${SUMMARY_TIMEOUT_MS}ms`)),
+          SUMMARY_TIMEOUT_MS,
+        ),
+      ),
+    ]);
+    if (debugLogPath) {
+      writeSummaryDebugEntry(debugLogPath, {
+        ts: new Date().toISOString(),
+        call: "primary",
+        provider,
+        model,
+        mode,
+        isCondensed,
+        aggressive: !!aggressive,
+        maxTokens: targetTokens,
+        temperature: aggressive ? 0.1 : 0.2,
+        extraBody: extraBody ?? null,
+        promptChars: prompt.length,
+        promptTokensEst: estimateTokens(prompt),
+        systemPrompt: LCM_SUMMARIZER_SYSTEM_PROMPT,
+        prompt,
+        responseContent: result.content,
+        latencyMs: Date.now() - t0,
+      });
+    }
 
     const normalized = normalizeCompletionSummary(result.content);
     let summary = normalized.summary;
@@ -775,7 +828,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       // reasoning budget to coax a textual response from providers that
       // sometimes return reasoning-only or empty blocks on the first pass.
       try {
-        const retryResult = await params.deps.complete({
+        const tRetry = Date.now();
+      const RETRY_TIMEOUT_MS = 60_000;
+      const retryResult = await Promise.race([
+        params.deps.complete({
           provider,
           model,
           apiKey,
@@ -793,7 +849,36 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           maxTokens: targetTokens,
           temperature: 0.05,
           reasoning: "low",
-        });
+          extraBody,
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`summary model retry timed out after ${RETRY_TIMEOUT_MS}ms`)),
+            RETRY_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+        if (debugLogPath) {
+          writeSummaryDebugEntry(debugLogPath, {
+            ts: new Date().toISOString(),
+            call: "retry",
+            provider,
+            model,
+            mode,
+            isCondensed,
+            aggressive: !!aggressive,
+            maxTokens: targetTokens,
+            temperature: 0.05,
+            reasoning: "low",
+            extraBody: extraBody ?? null,
+            promptChars: prompt.length,
+            promptTokensEst: estimateTokens(prompt),
+            systemPrompt: LCM_SUMMARIZER_SYSTEM_PROMPT,
+            prompt,
+            responseContent: retryResult.content,
+            latencyMs: Date.now() - tRetry,
+          });
+        }
 
         const retryNormalized = normalizeCompletionSummary(retryResult.content);
         summary = retryNormalized.summary;
