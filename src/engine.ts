@@ -24,6 +24,8 @@ import {
   type OzempicFeatureFlags,
 } from "./context-manifest.js";
 import {
+  isKnowledgeCapabilityEnabled,
+  isMemoryCapabilityEnabled,
   loadContextPolicy,
   resolveToolProvenanceWithPolicy,
   type ContextPolicy,
@@ -60,12 +62,23 @@ import {
   type CreateMessagePartInput,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { KnowledgeStore } from "./store/knowledge-store.js";
 import { SummaryStore } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssembleResultWithSystemPrompt = AssembleResult & { systemPromptAddition?: string };
+type AgentRuntimeCapabilities = {
+  agentId: string;
+  memoryEnabled: boolean;
+  memoryInjectHint: boolean;
+  knowledgeEnabled: boolean;
+  knowledgeInjectPackList: boolean;
+  knowledgeMaxInjectedPacks: number;
+  knowledgeExampleQuery?: string;
+  mountedKnowledgePackTitles: string[];
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -85,6 +98,13 @@ function safeString(value: unknown): string | undefined {
 
 function safeBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+function joinPromptBlocks(blocks: Array<string | undefined>): string | undefined {
+  const parts = blocks
+    .map((block) => (typeof block === "string" ? block.trim() : ""))
+    .filter((block) => block.length > 0);
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
 function appendTextValue(value: unknown, out: string[]): void {
@@ -611,6 +631,7 @@ export class LcmContextEngine implements ContextEngine {
 
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
+  private knowledgeStore: KnowledgeStore;
   private assembler: ContextAssembler;
   private compaction: CompactionEngine;
   private retrieval: RetrievalEngine;
@@ -636,6 +657,7 @@ export class LcmContextEngine implements ContextEngine {
 
     this.conversationStore = new ConversationStore(db, { fts5Available: this.fts5Available });
     this.summaryStore = new SummaryStore(db, { fts5Available: this.fts5Available });
+    this.knowledgeStore = new KnowledgeStore(db);
 
     if (!this.fts5Available) {
       this.deps.log.warn(
@@ -822,14 +844,7 @@ export class LcmContextEngine implements ContextEngine {
    * Returns null when no policy file exists, which disables all Tier 3 features.
    */
   private loadPolicyForSession(sessionId: string, sessionFile?: string): ContextPolicy | null {
-    // Extract agentId from session key (format: "agent:<agentId>:<suffix>")
-    const parsed = this.deps.parseAgentSessionKey?.(sessionId);
-    const rawAgentId = parsed?.agentId;
-    // Fallback: extract agentId from session file path (.../agents/<agentId>/sessions/...)
-    const agentIdFromFile = !rawAgentId && sessionFile
-      ? sessionFile.match(/[/\\]agents[/\\]([^/\\]+)[/\\]sessions[/\\]/)?.[1]
-      : undefined;
-    const agentId = this.deps.normalizeAgentId?.(rawAgentId ?? agentIdFromFile) ?? rawAgentId ?? agentIdFromFile ?? "main";
+    const agentId = this.resolveAgentIdForSession(sessionId, sessionFile);
 
     if (this.contextPolicyCache.has(agentId)) {
       return this.contextPolicyCache.get(agentId) ?? null;
@@ -844,6 +859,49 @@ export class LcmContextEngine implements ContextEngine {
     const policy = loadContextPolicy(policyPath);
     this.contextPolicyCache.set(agentId, policy);
     return policy;
+  }
+
+  private resolveAgentIdForSession(sessionId: string, sessionFile?: string): string {
+    const parsed = this.deps.parseAgentSessionKey?.(sessionId);
+    const rawAgentId = parsed?.agentId;
+    const agentIdFromFile = !rawAgentId && sessionFile
+      ? sessionFile.match(/[/\\]agents[/\\]([^/\\]+)[/\\]sessions[/\\]/)?.[1]
+      : undefined;
+    return this.deps.normalizeAgentId?.(rawAgentId ?? agentIdFromFile) ?? rawAgentId ?? agentIdFromFile ?? "main";
+  }
+
+  private buildCapabilityPrompt(sessionId: string, sessionFile?: string): string | undefined {
+    const caps = this.getRuntimeCapabilities(sessionId, sessionFile);
+    const sections: string[] = [];
+
+    if (caps.memoryEnabled && caps.memoryInjectHint) {
+      sections.push(
+        "## LCM Memory",
+        "",
+        "You have long-term session memory via LCM.",
+        "Use `lcm_grep` to search past work, `lcm_describe` for focused summary inspection, and `lcm_expand_query` when you need detailed recall from compressed history.",
+      );
+    }
+
+    if (caps.knowledgeEnabled && caps.knowledgeInjectPackList && caps.mountedKnowledgePackTitles.length > 0) {
+      const visibleTitles = caps.mountedKnowledgePackTitles.slice(0, caps.knowledgeMaxInjectedPacks);
+      const hiddenCount = caps.mountedKnowledgePackTitles.length - visibleTitles.length;
+      const titleLine = hiddenCount > 0
+        ? `${visibleTitles.join("; ")}; +${hiddenCount} more`
+        : visibleTitles.join("; ");
+      sections.push(
+        "",
+        "## Knowledge Packs",
+        "",
+        `Mounted packs: ${titleLine}.`,
+        "Use `lcm_knowledge_search` to search these references.",
+      );
+      if (caps.knowledgeExampleQuery) {
+        sections.push(`Example: \`lcm_knowledge_search(query: \"${caps.knowledgeExampleQuery}\")\``);
+      }
+    }
+
+    return sections.length > 0 ? sections.join("\n") : undefined;
   }
 
   /**
@@ -1688,11 +1746,16 @@ export class LcmContextEngine implements ContextEngine {
         void writeContextManifest(manifest, defaultManifestDir());
       }
 
+      const systemPromptAddition = joinPromptBlocks([
+        assembled.systemPromptAddition,
+        this.buildCapabilityPrompt(params.sessionId, params.sessionFile),
+      ]);
+
       const result: AssembleResultWithSystemPrompt = {
         messages: assembled.messages,
         estimatedTokens: assembled.estimatedTokens,
-        ...(assembled.systemPromptAddition
-          ? { systemPromptAddition: assembled.systemPromptAddition }
+        ...(systemPromptAddition
+          ? { systemPromptAddition }
           : {}),
       };
       return result;
@@ -2059,6 +2122,7 @@ export class LcmContextEngine implements ContextEngine {
   // ── Public accessors for retrieval (used by subagent expansion) ─────────
 
   getRetrieval(): RetrievalEngine {
+    this.ensureMigrated();
     return this.retrieval;
   }
 
@@ -2067,19 +2131,58 @@ export class LcmContextEngine implements ContextEngine {
     agentId: string;
   } {
     const policy = this.loadPolicyForSession(sessionId ?? "", sessionFile);
-    const agentId =
-      this.deps.normalizeAgentId?.(
-        this.deps.parseAgentSessionKey?.(sessionId ?? "")?.agentId,
-      ) ?? "main";
+    const agentId = this.resolveAgentIdForSession(sessionId ?? "", sessionFile);
     return { searchConfig: policy?.search ?? null, agentId };
   }
 
+  getRuntimeCapabilities(sessionId?: string, sessionFile?: string): AgentRuntimeCapabilities {
+    const normalizedSessionId = sessionId ?? "";
+    const agentId = this.resolveAgentIdForSession(normalizedSessionId, sessionFile);
+    const policy = this.loadPolicyForSession(normalizedSessionId, sessionFile);
+    const memoryEnabled = isMemoryCapabilityEnabled(policy);
+    const memoryInjectHint = policy?.memory?.injectHint !== false;
+    const knowledgeEnabled = isKnowledgeCapabilityEnabled(policy);
+    const knowledgeInjectPackList = policy?.knowledge?.injectPackList !== false;
+    const maxInjectedPacks = Math.max(1, Math.trunc(policy?.knowledge?.maxInjectedPacks ?? 8));
+    const knowledgeExampleQuery = typeof policy?.knowledge?.exampleQuery === "string"
+      ? policy.knowledge.exampleQuery.trim() || undefined
+      : undefined;
+
+    let mountedKnowledgePackTitles: string[] = [];
+    if (knowledgeEnabled) {
+      this.ensureMigrated();
+      const mounts = this.knowledgeStore.listMountedPacks(agentId, true);
+      mountedKnowledgePackTitles = mounts.map((mount) => {
+        const pack = this.knowledgeStore.getPack(mount.packId);
+        return pack?.name?.trim() || mount.packId;
+      });
+    }
+
+    return {
+      agentId,
+      memoryEnabled,
+      memoryInjectHint,
+      knowledgeEnabled,
+      knowledgeInjectPackList,
+      knowledgeMaxInjectedPacks: maxInjectedPacks,
+      knowledgeExampleQuery,
+      mountedKnowledgePackTitles,
+    };
+  }
+
   getConversationStore(): ConversationStore {
+    this.ensureMigrated();
     return this.conversationStore;
   }
 
   getSummaryStore(): SummaryStore {
+    this.ensureMigrated();
     return this.summaryStore;
+  }
+
+  getKnowledgeStore(): KnowledgeStore {
+    this.ensureMigrated();
+    return this.knowledgeStore;
   }
 
   // ── Heartbeat pruning ──────────────────────────────────────────────────

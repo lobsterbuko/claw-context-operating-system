@@ -13,6 +13,8 @@ import { createLcmDescribeTool } from "./src/tools/lcm-describe-tool.js";
 import { createLcmExpandQueryTool } from "./src/tools/lcm-expand-query-tool.js";
 import { createLcmExpandTool } from "./src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "./src/tools/lcm-grep-tool.js";
+import { createLcmKnowledgeListTool } from "./src/tools/lcm-knowledge-list-tool.js";
+import { createLcmKnowledgeSearchTool } from "./src/tools/lcm-knowledge-search-tool.js";
 import type { LcmDependencies } from "./src/types.js";
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
@@ -37,6 +39,10 @@ function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: st
 function normalizeAgentId(agentId: string | undefined): string {
   const normalized = (agentId ?? "").trim();
   return normalized.length > 0 ? normalized : "main";
+}
+
+function maybeTool<T>(enabled: boolean, build: () => T): T {
+  return enabled ? build() : (undefined as T);
 }
 
 type PluginEnvSnapshot = {
@@ -1287,33 +1293,65 @@ const lcmPlugin = {
 
     api.registerContextEngine("lossless-claw", () => lcm);
     api.registerTool((ctx) =>
-      createLcmGrepTool({
-        deps,
-        lcm,
-        sessionKey: ctx.sessionKey,
-      }),
+      maybeTool(
+        lcm.getRuntimeCapabilities(ctx.sessionKey).memoryEnabled,
+        () => createLcmGrepTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      ),
     );
     api.registerTool((ctx) =>
-      createLcmDescribeTool({
-        deps,
-        lcm,
-        sessionKey: ctx.sessionKey,
-      }),
+      maybeTool(
+        lcm.getRuntimeCapabilities(ctx.sessionKey).memoryEnabled,
+        () => createLcmDescribeTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      ),
     );
     api.registerTool((ctx) =>
-      createLcmExpandTool({
-        deps,
-        lcm,
-        sessionKey: ctx.sessionKey,
-      }),
+      maybeTool(
+        lcm.getRuntimeCapabilities(ctx.sessionKey).memoryEnabled,
+        () => createLcmExpandTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      ),
     );
     api.registerTool((ctx) =>
-      createLcmExpandQueryTool({
-        deps,
-        lcm,
-        sessionKey: ctx.sessionKey,
-        requesterSessionKey: ctx.sessionKey,
-      }),
+      maybeTool(
+        lcm.getRuntimeCapabilities(ctx.sessionKey).memoryEnabled,
+        () => createLcmExpandQueryTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+          requesterSessionKey: ctx.sessionKey,
+        }),
+      ),
+    );
+    api.registerTool((ctx) =>
+      maybeTool(
+        lcm.getRuntimeCapabilities(ctx.sessionKey).knowledgeEnabled,
+        () => createLcmKnowledgeListTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      ),
+    );
+    api.registerTool((ctx) =>
+      maybeTool(
+        lcm.getRuntimeCapabilities(ctx.sessionKey).knowledgeEnabled,
+        () => createLcmKnowledgeSearchTool({
+          deps,
+          lcm,
+          sessionKey: ctx.sessionKey,
+        }),
+      ),
     );
 
     api.logger.info(

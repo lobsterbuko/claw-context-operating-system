@@ -27,3 +27,17 @@ export type {
   CreateLargeFileInput,
   LargeFileRecord,
 } from "./summary-store.js";
+
+export { KnowledgeStore } from "./knowledge-store.js";
+export type {
+  KnowledgeMountMode,
+  KnowledgePackRecord,
+  CreateKnowledgePackInput,
+  KnowledgeDocumentRecord,
+  CreateKnowledgeDocumentInput,
+  KnowledgeChunkRecord,
+  CreateKnowledgeChunkInput,
+  KnowledgeChunkEmbeddingRecord,
+  KnowledgeChunkCandidateRecord,
+  AgentKnowledgeMountRecord,
+} from "./knowledge-store.js";

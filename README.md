@@ -196,6 +196,89 @@ Ozempic is a set of context management features built into lossless-claw. Its jo
 
 All features are independently toggleable. Sensible defaults work for any agent without configuration.
 
+### Additions in this fork
+
+This fork extends Ozempic beyond the base DAG compaction layer. The focus is practical local-agent operations: better observability, stronger agent-specific policy control, safer session-state routing, and a separate imported-knowledge substrate that does not pollute experiential memory.
+
+#### Per-agent Ozempic policy
+
+Agents can now define richer behavior in `context-policy.json`, including:
+
+- `summaryInstructions` for agent-specific summarizer behavior
+- session-state routing controls such as `timeoutMs`, `fallbackOnBusy`, and `fallbackOnFailure`
+- explicit memory and knowledge capability switches:
+  - `memory.enabled`
+  - `memory.injectHint`
+  - `knowledge.enabled`
+  - `knowledge.injectPackList`
+  - `knowledge.maxInjectedPacks`
+  - `knowledge.exampleQuery`
+
+These controls let an agent expose only the memory/knowledge surfaces it should actually use.
+
+#### Runtime memory and knowledge hints
+
+Ozempic can now inject compact runtime guidance into the system prompt:
+
+- when memory is enabled, the agent gets a short hint that LCM recall tools exist and when to use them
+- when knowledge is enabled, the agent gets a short mounted-pack title list plus an example `lcm_knowledge_search` query
+
+This keeps dynamic capability facts in runtime injection instead of relying only on workspace prose.
+
+#### Knowledge Packs
+
+Knowledge Packs are a separate imported-knowledge layer inside `lcm.db`.
+
+- stored separately from conversation summaries
+- mounted per agent
+- retrieved on demand with `lcm_knowledge_search`
+- discoverable with `lcm_knowledge_list`
+- imported offline by an operator, not by agents
+
+Current import formats:
+
+- `txt`
+- `md`
+- `json`
+- `html`
+- `htm`
+- `docx`
+- `doc`
+- `rtf`
+- `rtfd`
+- `pdf`
+
+Operator admin flow:
+
+```bash
+npm run knowledge:admin -- import --agent coder --pack-id coder-openclaw-system-v1 --file /absolute/path/to/file.md
+npm run knowledge:admin -- list --agent coder
+npm run knowledge:admin -- mount --agent coder --pack-id coder-openclaw-system-v1
+npm run knowledge:admin -- unmount --agent coder --pack-id coder-openclaw-system-v1
+```
+
+#### LLM usage logging
+
+This fork adds append-only JSONL logging for internal LCM model traffic:
+
+- summary model calls
+- session-state model calls
+- embedding requests
+- reranker requests
+
+The intent is operational debugging, soak-test forensics, and visibility into what the local model lanes are doing.
+
+#### Session-state routing
+
+Session-state updates now support a more deliberate model-routing policy:
+
+- primary model can remain the stronger local lane
+- `fallbackOnBusy` proactively routes around known summary-lane contention
+- `fallbackOnFailure` can be enabled selectively per agent
+- long timeout behavior is configurable per agent
+
+This makes session-state behavior tunable for agents where continuity is critical versus agents where it is optional.
+
 ### Tier 1 — Engine features
 
 Core context management mechanics. Always beneficial. Configured in `plugins.entries.lossless-claw.config`.

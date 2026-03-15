@@ -3,6 +3,7 @@ import { sanitizeToolUseResultPairing } from "./transcript-repair.js";
 import { classifyToolProvenance, type ManifestItem, type ProvenanceKind } from "./context-manifest.js";
 import {
   applyCompactionRules,
+  isMemoryCapabilityEnabled,
   isFreshnessExpired,
   resolveToolProvenanceWithPolicy,
   type ContextPolicy,
@@ -703,7 +704,9 @@ export class ContextAssembler {
       }
     }
 
-    const systemPromptAddition = buildSystemPromptAddition(summarySignals);
+    const systemPromptAddition = isMemoryCapabilityEnabled(params.contextPolicy)
+      ? buildSystemPromptAddition(summarySignals)
+      : undefined;
 
     // Step 3: Split into evictable prefix and protected fresh tail
     const tailStart = Math.max(0, resolved.length - freshTailCount);

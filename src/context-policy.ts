@@ -14,6 +14,24 @@ export interface ToolResultCompactionRule {
   maxTokens: number;
 }
 
+export interface MemoryCapabilityConfig {
+  /** When false, LCM memory tools and memory prompt hints are disabled for this agent. */
+  enabled?: boolean;
+  /** When false, the runtime memory hint is omitted from the system prompt. */
+  injectHint?: boolean;
+}
+
+export interface KnowledgeCapabilityConfig {
+  /** When true, Knowledge Pack tools and prompt hints are enabled for this agent. */
+  enabled?: boolean;
+  /** When false, mounted pack titles are omitted from the runtime system prompt. */
+  injectPackList?: boolean;
+  /** Max number of mounted pack titles to inject into the runtime system prompt. */
+  maxInjectedPacks?: number;
+  /** Optional example query string shown in the runtime system prompt. */
+  exampleQuery?: string;
+}
+
 export interface ContextPolicy {
   /** Tier 1/2 config overrides (handled by engine config resolution, not here). */
   overrides?: Record<string, unknown>;
@@ -23,6 +41,12 @@ export interface ContextPolicy {
    * When omitted, the summarizer falls back to the default built-in prompt language.
    */
   summaryInstructions?: string;
+
+  /** Runtime controls for LCM experiential-memory discoverability. */
+  memory?: MemoryCapabilityConfig;
+
+  /** Runtime controls for Knowledge Pack discoverability and availability. */
+  knowledge?: KnowledgeCapabilityConfig;
 
   toolResultCompaction?: {
     rules: ToolResultCompactionRule[];
@@ -75,6 +99,14 @@ export function loadContextPolicy(policyPath: string): ContextPolicy | null {
   } catch {
     return null;
   }
+}
+
+export function isMemoryCapabilityEnabled(policy: ContextPolicy | null): boolean {
+  return policy?.memory?.enabled !== false;
+}
+
+export function isKnowledgeCapabilityEnabled(policy: ContextPolicy | null): boolean {
+  return policy?.knowledge?.enabled === true;
 }
 
 // ── Custom tool classification ────────────────────────────────────────────────

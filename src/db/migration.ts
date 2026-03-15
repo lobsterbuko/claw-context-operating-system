@@ -491,6 +491,68 @@ export function runLcmMigrations(
       PRIMARY KEY (summary_id, agent_id)
     );
 
+    CREATE TABLE IF NOT EXISTS knowledge_packs (
+      pack_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      domain TEXT,
+      version TEXT,
+      status TEXT NOT NULL,
+      import_config_json TEXT NOT NULL DEFAULT '{}',
+      artifact_config_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS knowledge_documents (
+      document_id TEXT PRIMARY KEY,
+      pack_id TEXT NOT NULL REFERENCES knowledge_packs(pack_id) ON DELETE CASCADE,
+      title TEXT,
+      source_path TEXT,
+      source_url TEXT,
+      mime_type TEXT,
+      byte_size INTEGER,
+      content_hash TEXT NOT NULL,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS knowledge_chunks (
+      chunk_id TEXT PRIMARY KEY,
+      pack_id TEXT NOT NULL REFERENCES knowledge_packs(pack_id) ON DELETE CASCADE,
+      document_id TEXT NOT NULL REFERENCES knowledge_documents(document_id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL,
+      heading TEXT,
+      section_path TEXT,
+      content TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      char_count INTEGER NOT NULL,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      UNIQUE (document_id, ordinal)
+    );
+
+    CREATE TABLE IF NOT EXISTS knowledge_chunk_embeddings (
+      chunk_id TEXT NOT NULL REFERENCES knowledge_chunks(chunk_id) ON DELETE CASCADE,
+      model TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      embedding BLOB NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chunk_id, model)
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_knowledge_mounts (
+      agent_id TEXT NOT NULL,
+      pack_id TEXT NOT NULL REFERENCES knowledge_packs(pack_id) ON DELETE CASCADE,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      mode TEXT NOT NULL DEFAULT 'on_demand',
+      priority INTEGER NOT NULL DEFAULT 0,
+      primer_text TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (agent_id, pack_id)
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
@@ -498,6 +560,10 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type);
     CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS knowledge_documents_pack_idx ON knowledge_documents (pack_id, created_at);
+    CREATE INDEX IF NOT EXISTS knowledge_chunks_pack_idx ON knowledge_chunks (pack_id, ordinal);
+    CREATE INDEX IF NOT EXISTS knowledge_chunks_document_idx ON knowledge_chunks (document_id, ordinal);
+    CREATE INDEX IF NOT EXISTS agent_knowledge_mounts_agent_idx ON agent_knowledge_mounts (agent_id, enabled, priority DESC);
   `);
 
   // Forward-compatible conversations migration for existing DBs.
