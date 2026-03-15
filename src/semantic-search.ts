@@ -6,17 +6,11 @@
  *
  *   1. At compaction time: embed each new summary and store the vector.
  *   2. At query time:
- *      a. Embed the query.
+ *      a. Embed the query via /v1/embeddings.
  *      b. Cosine-similarity scan over stored summary vectors → top N candidates.
- *      c. Reranker scores each (query, candidate) pair via Qwen3-Reranker
- *         logprobs → re-sort → return top K.
+ *      c. Reranker scores via /v1/rerank (native oMLX endpoint) → re-sort → top K.
  *
- * Both the embedding model and the reranker are called via direct HTTP to
- * their respective OpenAI-compatible endpoints, because:
- *   - Embeddings need /v1/embeddings (not a chat completion).
- *   - The reranker needs /v1/completions with a pre-filled prompt + logprobs.
- *
- * Both are fire-and-forget-safe: failures are logged and fall back to FTS5.
+ * Both are fire-and-forget-safe: failures log and fall back to FTS5.
  */
 
 // ── Config types ──────────────────────────────────────────────────────────────
@@ -210,31 +204,6 @@ export function serializeEmbedding(embedding: number[]): Buffer {
 
 // ── Reranker client ───────────────────────────────────────────────────────────
 
-/**
- * Qwen3-Reranker system prompt (per HuggingFace docs).
- */
-const RERANKER_SYSTEM = `Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".`;
-
-/**
- * The Qwen3-Reranker pre-fills an empty <think> block before the yes/no answer.
- * We append this as a raw suffix after the chat template closes the user turn,
- * then call /v1/completions (raw text) so the model outputs one token: yes or no.
- */
-const RERANKER_THINK_SUFFIX = `<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`;
-
-function buildRerankerPrompt(
-  instruction: string,
-  query: string,
-  doc: string,
-): string {
-  const userContent = `<Instruct>: ${instruction}\n<Query>: ${query}\n<Document>: ${doc}`;
-  return (
-    `<|im_start|>system\n${RERANKER_SYSTEM}<|im_end|>\n` +
-    `<|im_start|>user\n${userContent}` +
-    RERANKER_THINK_SUFFIX
-  );
-}
-
 export interface RankedCandidate {
   summaryId: string;
   content: string;
@@ -242,55 +211,19 @@ export interface RankedCandidate {
 }
 
 /**
- * Rerank a list of candidates against a query using Qwen3-Reranker.
- *
- * Calls /v1/completions with max_tokens=1 and logprobs=true.
- * Extracts the probability of the "yes" token as the relevance score.
- * Falls back to cosine similarity score if logprobs are unavailable.
+ * Rerank candidates using the /v1/rerank endpoint (native oMLX / Jina-style API).
+ * Falls back to returning candidates in vector-score order if the call fails.
  */
 export async function rerankCandidates(
   config: RerankerConfig,
   query: string,
   candidates: Array<{ summaryId: string; content: string; vectorScore: number }>,
 ): Promise<RankedCandidate[]> {
-  const instruction =
-    config.taskInstruction ??
-    "Given a user query about past conversation history, judge whether this summary is relevant and useful to answer the query.";
-
   const topK = config.topK ?? 8;
 
-  // Build one prompt per candidate
-  const prompts = candidates.map((c) =>
-    buildRerankerPrompt(instruction, query, c.content.slice(0, 2000)),
-  );
-
-  // Batch: call each prompt. We parallelize but rate-limit to avoid flooding.
-  const scores: number[] = new Array(candidates.length).fill(0);
-
-  const BATCH_SIZE = 5;
-  for (let i = 0; i < prompts.length; i += BATCH_SIZE) {
-    const batch = prompts.slice(i, i + BATCH_SIZE);
-    const results = await Promise.all(
-      batch.map((prompt, j) => scoreOneCandidate(config, prompt, candidates[i + j].vectorScore)),
-    );
-    for (let j = 0; j < results.length; j++) {
-      scores[i + j] = results[j];
-    }
-  }
-
-  return candidates
-    .map((c, i) => ({ summaryId: c.summaryId, content: c.content, score: scores[i] }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
-}
-
-async function scoreOneCandidate(
-  config: RerankerConfig,
-  prompt: string,
-  fallbackScore: number,
-): Promise<number> {
   try {
-    const res = await fetch(`${config.baseUrl}/completions`, {
+    const documents = candidates.map((c) => c.content.slice(0, 2000));
+    const res = await fetch(`${config.baseUrl}/rerank`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -298,52 +231,46 @@ async function scoreOneCandidate(
       },
       body: JSON.stringify({
         model: config.model,
-        prompt,
-        max_tokens: 1,
-        temperature: 0,
-        logprobs: 5,
+        query,
+        documents,
+        top_n: topK,
+        ...(config.taskInstruction ? { instruction: config.taskInstruction } : {}),
       }),
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(60_000),
     });
-    if (!res.ok) return fallbackScore;
 
-    const json = (await res.json()) as {
-      choices?: Array<{
-        logprobs?: {
-          top_logprobs?: Array<Record<string, number>>;
-          tokens?: string[];
-          token_logprobs?: number[];
-        };
-        text?: string;
-      }>;
-    };
-
-    const choice = json.choices?.[0];
-    if (!choice) return fallbackScore;
-
-    // Try top_logprobs (OpenAI format: array of {token: logprob} per position)
-    const topLogprobs = choice.logprobs?.top_logprobs?.[0];
-    if (topLogprobs) {
-      const yesLogprob = topLogprobs["yes"] ?? topLogprobs["Yes"] ?? topLogprobs[" yes"] ?? null;
-      const noLogprob = topLogprobs["no"] ?? topLogprobs["No"] ?? topLogprobs[" no"] ?? null;
-      if (yesLogprob !== null && noLogprob !== null) {
-        // softmax(yes, no)
-        const yesExp = Math.exp(yesLogprob);
-        const noExp = Math.exp(noLogprob);
-        return yesExp / (yesExp + noExp);
-      }
-      // If only yes token is in top_logprobs, use its raw probability
-      if (yesLogprob !== null) return Math.exp(yesLogprob);
+    if (!res.ok) {
+      // Fall back to vector order
+      return candidates
+        .sort((a, b) => b.vectorScore - a.vectorScore)
+        .slice(0, topK)
+        .map((c) => ({ summaryId: c.summaryId, content: c.content, score: c.vectorScore }));
     }
 
-    // Fallback: check the generated token text
-    const text = (choice.text ?? "").trim().toLowerCase();
-    if (text === "yes") return 0.9;
-    if (text === "no") return 0.1;
+    const json = (await res.json()) as {
+      results?: Array<{ index: number; relevance_score: number }>;
+    };
 
-    return fallbackScore;
+    if (!json.results || json.results.length === 0) {
+      return candidates
+        .sort((a, b) => b.vectorScore - a.vectorScore)
+        .slice(0, topK)
+        .map((c) => ({ summaryId: c.summaryId, content: c.content, score: c.vectorScore }));
+    }
+
+    return json.results
+      .sort((a, b) => b.relevance_score - a.relevance_score)
+      .slice(0, topK)
+      .map((r) => ({
+        summaryId: candidates[r.index].summaryId,
+        content: candidates[r.index].content,
+        score: r.relevance_score,
+      }));
   } catch {
-    return fallbackScore;
+    return candidates
+      .sort((a, b) => b.vectorScore - a.vectorScore)
+      .slice(0, topK)
+      .map((c) => ({ summaryId: c.summaryId, content: c.content, score: c.vectorScore }));
   }
 }
 
