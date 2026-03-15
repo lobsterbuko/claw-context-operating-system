@@ -481,6 +481,16 @@ export function runLcmMigrations(
       PRIMARY KEY (session_id, agent_id)
     );
 
+    CREATE TABLE IF NOT EXISTS summary_embeddings (
+      summary_id  TEXT    NOT NULL,
+      agent_id    TEXT    NOT NULL,
+      embedding   BLOB    NOT NULL,
+      model       TEXT    NOT NULL,
+      dimensions  INTEGER NOT NULL,
+      created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (summary_id, agent_id)
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);

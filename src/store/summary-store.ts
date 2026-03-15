@@ -68,6 +68,8 @@ export type SummarySearchResult = {
   snippet: string;
   createdAt: Date;
   rank?: number;
+  /** Relevance score from semantic search (0-1). Only set when semantic=true. */
+  score?: number;
 };
 
 export type CreateLargeFileInput = {
@@ -914,5 +916,52 @@ export class SummaryStore {
       )
       .all(conversationId) as unknown as LargeFileRow[];
     return rows.map(toLargeFileRecord);
+  }
+
+  // ── Embedding storage ───────────────────────────────────────────────────────
+
+  storeEmbedding(summaryId: string, agentId: string, embedding: Buffer, model: string, dimensions: number): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO summary_embeddings (summary_id, agent_id, embedding, model, dimensions, created_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))`,
+      )
+      .run(summaryId, agentId, embedding, model, dimensions);
+  }
+
+  /**
+   * Fetch all stored embeddings for a conversation's summaries, for a given agent.
+   * Returns summary_id + embedding blob pairs for cosine similarity scan.
+   */
+  getEmbeddingsForConversation(
+    conversationId: number,
+    agentId: string,
+  ): Array<{ summaryId: string; content: string; embedding: Buffer }> {
+    const rows = this.db
+      .prepare(
+        `SELECT s.summary_id, s.content, e.embedding
+         FROM summaries s
+         JOIN summary_embeddings e ON e.summary_id = s.summary_id AND e.agent_id = ?
+         WHERE s.conversation_id = ?`,
+      )
+      .all(agentId, conversationId) as Array<{
+      summary_id: string;
+      content: string;
+      embedding: Buffer;
+    }>;
+    return rows.map((r) => ({
+      summaryId: r.summary_id,
+      content: r.content,
+      embedding: r.embedding,
+    }));
+  }
+
+  hasEmbedding(summaryId: string, agentId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM summary_embeddings WHERE summary_id = ? AND agent_id = ?`,
+      )
+      .get(summaryId, agentId);
+    return row != null;
   }
 }

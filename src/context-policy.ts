@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { classifyToolProvenance, type ProvenanceKind } from "./context-manifest.js";
 import { resolveSessionStateConfig, type SessionStateConfig } from "./session-state.js";
+import { resolveSemanticSearchConfig, type SemanticSearchConfig } from "./semantic-search.js";
 
 // ── Context policy types ───────────────────────────────────────────────────────
 
@@ -23,6 +24,9 @@ export interface ContextPolicy {
 
   /** Resolved session state config (populated by loadContextPolicy). */
   sessionState?: SessionStateConfig | null;
+
+  /** Resolved semantic search config (populated by loadContextPolicy). */
+  search?: SemanticSearchConfig | null;
 
   toolClassification?: {
     observed?: string[];
@@ -56,6 +60,10 @@ export function loadContextPolicy(policyPath: string): ContextPolicy | null {
     // Resolve sessionState config so consumers get a typed object (or null).
     policy.sessionState = resolveSessionStateConfig(
       (parsed as Record<string, unknown>).sessionState,
+    );
+    // Resolve semantic search config.
+    policy.search = resolveSemanticSearchConfig(
+      (parsed as Record<string, unknown>).search,
     );
     return policy;
   } catch {

@@ -29,6 +29,10 @@ import {
   type ContextPolicy,
 } from "./context-policy.js";
 import {
+  embedDocument,
+  serializeEmbedding,
+} from "./semantic-search.js";
+import {
   extractToolResultsFromMessages,
   loadSessionState,
   renderSessionStateBlock,
@@ -1746,6 +1750,34 @@ export class LcmContextEngine implements ContextEngine {
       });
       const tokensBefore = observedTokens ?? leafResult.tokensBefore;
 
+      // Fire-and-forget: embed new summary if semantic search is configured.
+      if (leafResult.actionTaken && leafResult.createdSummaryId) {
+        const policy = this.loadPolicyForSession(params.sessionId, params.sessionFile);
+        const searchConfig = policy?.search;
+        if (searchConfig?.embedding) {
+          const summaryId = leafResult.createdSummaryId;
+          const embCfg = searchConfig.embedding;
+          const agentId = this.deps.normalizeAgentId?.(
+            this.deps.parseAgentSessionKey?.(params.sessionId)?.agentId,
+          ) ?? "main";
+          void (async () => {
+            try {
+              const summary = await this.summaryStore.getSummary(summaryId);
+              if (!summary || this.summaryStore.hasEmbedding(summaryId, agentId)) return;
+              const vec = await embedDocument(embCfg, summary.content);
+              if (!vec) return;
+              const blob = serializeEmbedding(vec);
+              const dims = embCfg.dimensions ?? vec.length;
+              this.summaryStore.storeEmbedding(summaryId, agentId, blob, embCfg.model, dims);
+            } catch (err) {
+              this.deps.log.warn(
+                `[lcm] semantic-search: embedding failed for ${summaryId} — ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          })();
+        }
+      }
+
       return {
         ok: true,
         compacted: leafResult.actionTaken,
@@ -1990,6 +2022,18 @@ export class LcmContextEngine implements ContextEngine {
 
   getRetrieval(): RetrievalEngine {
     return this.retrieval;
+  }
+
+  getSearchConfig(sessionId?: string, sessionFile?: string): {
+    searchConfig: import("./semantic-search.js").SemanticSearchConfig | null;
+    agentId: string;
+  } {
+    const policy = this.loadPolicyForSession(sessionId ?? "", sessionFile);
+    const agentId =
+      this.deps.normalizeAgentId?.(
+        this.deps.parseAgentSessionKey?.(sessionId ?? "")?.agentId,
+      ) ?? "main";
+    return { searchConfig: policy?.search ?? null, agentId };
   }
 
   getConversationStore(): ConversationStore {

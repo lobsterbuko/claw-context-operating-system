@@ -9,6 +9,11 @@ import type {
   SummarySearchResult,
   LargeFileRecord,
 } from "./store/summary-store.js";
+import {
+  semanticSearch,
+  type SemanticSearchConfig,
+  type SemanticSearchResult,
+} from "./semantic-search.js";
 
 // ── Public interfaces ────────────────────────────────────────────────────────
 
@@ -68,6 +73,12 @@ export interface GrepInput {
   since?: Date;
   before?: Date;
   limit?: number;
+  /** When true, use semantic search (embed + rerank) over FTS5 for summaries. */
+  semantic?: boolean;
+  /** Agent ID — required when semantic=true to scope stored embeddings. */
+  agentId?: string;
+  /** Semantic search config — required when semantic=true. */
+  semanticConfig?: SemanticSearchConfig;
 }
 
 export interface GrepResult {
@@ -224,6 +235,11 @@ export class RetrievalEngine {
   async grep(input: GrepInput): Promise<GrepResult> {
     const { query, mode, scope, conversationId, since, before, limit } = input;
 
+    // Semantic path: vector + rerank for summary search, FTS5 for messages.
+    if (input.semantic && input.semanticConfig && conversationId != null) {
+      return this.grepSemantic(input, conversationId);
+    }
+
     const searchInput = { query, mode, conversationId, since, before, limit };
 
     let messages: MessageSearchResult[] = [];
@@ -243,6 +259,71 @@ export class RetrievalEngine {
 
     messages.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
     summaries.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+
+    return {
+      messages,
+      summaries,
+      totalMatches: messages.length + summaries.length,
+    };
+  }
+
+  private async grepSemantic(input: GrepInput, conversationId: number): Promise<GrepResult> {
+    const { query, scope, since, before, limit, agentId = "main", semanticConfig } = input;
+
+    // Messages still use FTS5 (semantic search targets summaries).
+    let messages: MessageSearchResult[] = [];
+    if (scope === "messages" || scope === "both") {
+      messages = await this.conversationStore.searchMessages({
+        query,
+        mode: "full_text",
+        conversationId,
+        since,
+        before,
+        limit,
+      });
+      messages.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    }
+
+    let summaries: SummarySearchResult[] = [];
+    if (scope === "summaries" || scope === "both") {
+      // Load all stored embeddings for this conversation + agent.
+      const candidates = this.summaryStore.getEmbeddingsForConversation(
+        conversationId,
+        agentId,
+      );
+
+      if (candidates.length > 0 && semanticConfig) {
+        const results: SemanticSearchResult[] = await semanticSearch({
+          query,
+          candidates,
+          config: semanticConfig,
+          maxCandidates: semanticConfig.reranker?.maxCandidates ?? 30,
+          topK: limit ?? semanticConfig.reranker?.topK ?? 8,
+        });
+
+        // Map SemanticSearchResult → SummarySearchResult shape
+        summaries = results.map((r) => ({
+          summaryId: r.summaryId,
+          conversationId,
+          kind: "leaf" as const,
+          snippet: r.content.slice(0, 500),
+          createdAt: new Date(),
+          score: r.score,
+        }));
+      } else {
+        // No embeddings available — fall back to FTS5
+        const ftsResults = await this.summaryStore.searchSummaries({
+          query,
+          mode: "full_text",
+          conversationId,
+          since,
+          before,
+          limit,
+        });
+        summaries = ftsResults;
+        summaries.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      }
+    }
 
     return {
       messages,

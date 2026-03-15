@@ -56,6 +56,14 @@ const LcmGrepSchema = Type.Object({
       maximum: 200,
     }),
   ),
+  semantic: Type.Optional(
+    Type.Boolean({
+      description:
+        "Set true to use semantic search (vector embeddings + reranking) instead of keyword matching. " +
+        "Finds conceptually related content even when exact words differ. " +
+        "Requires semantic search to be configured in the agent policy. Falls back to FTS5 if not available.",
+    }),
+  ),
 });
 
 function truncateSnippet(content: string, maxLen: number = 200): string {
@@ -76,11 +84,12 @@ export function createLcmGrepTool(input: {
     name: "lcm_grep",
     label: "LCM Grep",
     description:
-      "Search compacted conversation history using regex or full-text search. " +
+      "Search compacted conversation history using keyword or semantic search. " +
       "Searches across messages and/or summaries stored by LCM. " +
       "Use this to find specific content that may have been compacted away from " +
       "active context. Returns matching snippets with their summary/message IDs " +
-      "for follow-up with lcm_expand or lcm_describe.",
+      "for follow-up with lcm_expand or lcm_describe. " +
+      "Set semantic=true for conceptual/semantic search (vector + reranking) instead of keyword matching.",
     parameters: LcmGrepSchema,
     async execute(_toolCallId, params) {
       const retrieval = input.lcm.getRetrieval();
@@ -91,6 +100,7 @@ export function createLcmGrepTool(input: {
       const mode = (p.mode as "regex" | "full_text") ?? "regex";
       const scope = (p.scope as "messages" | "summaries" | "both") ?? "both";
       const limit = typeof p.limit === "number" ? Math.trunc(p.limit) : 50;
+      const useSemantic = p.semantic === true;
       let since: Date | undefined;
       let before: Date | undefined;
       try {
@@ -120,20 +130,31 @@ export function createLcmGrepTool(input: {
         });
       }
 
+      // Resolve semantic search config for this session if requested.
+      const { searchConfig, agentId } = useSemantic
+        ? input.lcm.getSearchConfig(input.sessionId, input.sessionKey)
+        : { searchConfig: null, agentId: "main" };
+      const semanticEnabled = useSemantic && searchConfig != null;
+
       const result = await retrieval.grep({
         query: pattern,
-        mode,
+        mode: semanticEnabled ? "full_text" : mode,
         scope,
         conversationId: conversationScope.conversationId,
         limit,
         since,
         before,
+        ...(semanticEnabled && {
+          semantic: true,
+          agentId,
+          semanticConfig: searchConfig!,
+        }),
       });
 
       const lines: string[] = [];
       lines.push("## LCM Grep Results");
       lines.push(`**Pattern:** \`${pattern}\``);
-      lines.push(`**Mode:** ${mode} | **Scope:** ${scope}`);
+      lines.push(`**Mode:** ${semanticEnabled ? "semantic (vector+rerank)" : mode} | **Scope:** ${scope}`);
       if (conversationScope.allConversations) {
         lines.push("**Conversation scope:** all conversations");
       } else if (conversationScope.conversationId != null) {
@@ -172,7 +193,8 @@ export function createLcmGrepTool(input: {
         lines.push("");
         for (const sum of result.summaries) {
           const snippet = truncateSnippet(sum.snippet);
-          const line = `- [${sum.summaryId}] (${sum.kind}, ${formatTimestamp(sum.createdAt, timezone)}): ${snippet}`;
+          const scoreLabel = sum.score != null ? `, score=${sum.score.toFixed(3)}` : "";
+          const line = `- [${sum.summaryId}] (${sum.kind}${scoreLabel}, ${formatTimestamp(sum.createdAt, timezone)}): ${snippet}`;
           if (currentChars + line.length > MAX_RESULT_CHARS) {
             lines.push("*(truncated — more results available)*");
             break;
