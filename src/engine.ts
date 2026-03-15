@@ -1438,10 +1438,7 @@ export class LcmContextEngine implements ContextEngine {
       const ssApiKey = modelAccess.apiKey;
       const ssProviderApi = modelAccess.providerApi;
 
-      const agentId =
-        this.deps.normalizeAgentId?.(
-          this.deps.parseAgentSessionKey?.(sessionId)?.agentId,
-        ) ?? "main";
+      const agentId = this.resolveAgentIdForSession(sessionId, sessionFile);
 
       const db = getLcmConnection(this.config.databasePath);
 
@@ -1657,10 +1654,7 @@ export class LcmContextEngine implements ContextEngine {
       const ssConfig = contextPolicy?.sessionState;
       if (ssConfig?.enabled) {
         try {
-          const agentId =
-            this.deps.normalizeAgentId?.(
-              this.deps.parseAgentSessionKey?.(params.sessionId)?.agentId,
-            ) ?? "main";
+          const agentId = this.resolveAgentIdForSession(params.sessionId, params.sessionFile);
           const db = getLcmConnection(this.config.databasePath);
           const ssRecord = loadSessionState(db, params.sessionId, agentId);
           if (ssRecord) {
@@ -1857,9 +1851,7 @@ export class LcmContextEngine implements ContextEngine {
         if (searchConfig?.embedding) {
           const summaryId = leafResult.createdSummaryId;
           const embCfg = searchConfig.embedding;
-          const agentId = this.deps.normalizeAgentId?.(
-            this.deps.parseAgentSessionKey?.(params.sessionId)?.agentId,
-          ) ?? "main";
+          const agentId = this.resolveAgentIdForSession(params.sessionId, params.sessionFile);
           void (async () => {
             try {
               const summary = await this.summaryStore.getSummary(summaryId);

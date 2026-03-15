@@ -8,6 +8,7 @@ import type { KnowledgeMountMode, KnowledgeStore } from "./store/knowledge-store
 
 export type ImportKnowledgeFileInput = {
   packId: string;
+  packName?: string;
   filePath: string;
   title?: string;
   description?: string;
@@ -220,13 +221,18 @@ export async function importKnowledgeFile(input: {
   const overlapTokens = Math.max(0, Math.trunc(input.params.chunkOverlapTokens ?? 150));
   const { text, mimeType } = readSourceText(input.params.filePath);
   const title = input.params.title?.trim() || basename(input.params.filePath);
+  const existingPack = input.store.getPack(input.params.packId);
+  const packName =
+    input.params.packName?.trim() ||
+    existingPack?.name?.trim() ||
+    title ||
+    input.params.packId;
   const contentHash = createHash("sha256").update(text).digest("hex");
-  const documentId = `doc_${randomUUID()}`;
   const createdAt = new Date();
 
   input.store.upsertPack({
     packId: input.params.packId,
-    name: input.params.packId,
+    name: packName,
     description: input.params.description,
     domain: input.params.domain,
     version: input.params.version,
@@ -234,6 +240,78 @@ export async function importKnowledgeFile(input: {
     updatedAt: createdAt,
   });
 
+  const chunkDrafts = chunkText({
+    text,
+    targetTokens,
+    overlapTokens,
+  });
+
+  const embeddingConfig = input.params.searchConfig?.embedding ?? null;
+  const existingDocuments = input.store.findDocumentsBySource(
+    input.params.packId,
+    input.params.filePath,
+    contentHash,
+  );
+  if (existingDocuments.length > 0) {
+    const rankedExisting = [...existingDocuments].sort((a, b) => {
+      const aEmbedded = embeddingConfig
+        ? input.store.countEmbeddedChunksForDocument(a.documentId, embeddingConfig.model)
+        : 0;
+      const bEmbedded = embeddingConfig
+        ? input.store.countEmbeddedChunksForDocument(b.documentId, embeddingConfig.model)
+        : 0;
+      if (bEmbedded !== aEmbedded) return bEmbedded - aEmbedded;
+      return a.createdAt.getTime() - b.createdAt.getTime();
+    });
+    const existing = rankedExisting[0];
+    const existingChunks = input.store.listChunksForDocument(existing.documentId);
+    let embeddedChunkCount = embeddingConfig
+      ? input.store.countEmbeddedChunksForDocument(existing.documentId, embeddingConfig.model)
+      : 0;
+
+    if (
+      embeddingConfig &&
+      existingChunks.length > 0 &&
+      embeddedChunkCount < existingChunks.length
+    ) {
+      const embeddings = await embedTexts(
+        embeddingConfig,
+        existingChunks.map((chunk) => chunk.content),
+      );
+      if (embeddings && embeddings.length === existingChunks.length) {
+        for (let i = 0; i < embeddings.length; i++) {
+          input.store.storeChunkEmbedding(
+            existingChunks[i].chunkId,
+            embeddingConfig.model,
+            embeddings[i].length,
+            serializeEmbedding(embeddings[i]),
+          );
+        }
+        embeddedChunkCount = embeddings.length;
+      }
+    }
+
+    let mountedToAgent: string | null = null;
+    if (input.params.mount !== false && input.params.agentId) {
+      input.store.mountPack({
+        agentId: input.params.agentId,
+        packId: input.params.packId,
+        mode: input.params.mountMode ?? "on_demand",
+      });
+      mountedToAgent = input.params.agentId;
+    }
+
+    return {
+      packId: input.params.packId,
+      documentId: existing.documentId,
+      title,
+      chunkCount: existingChunks.length,
+      embeddedChunkCount,
+      mountedToAgent,
+    };
+  }
+
+  const documentId = `doc_${randomUUID()}`;
   input.store.insertDocument({
     documentId,
     packId: input.params.packId,
@@ -244,12 +322,6 @@ export async function importKnowledgeFile(input: {
     contentHash,
     metadataJson: JSON.stringify({ importedFrom: input.params.filePath }),
     createdAt,
-  });
-
-  const chunkDrafts = chunkText({
-    text,
-    targetTokens,
-    overlapTokens,
   });
 
   const chunkIds: string[] = [];
@@ -272,7 +344,6 @@ export async function importKnowledgeFile(input: {
   }
 
   let embeddedChunkCount = 0;
-  const embeddingConfig = input.params.searchConfig?.embedding ?? null;
   if (embeddingConfig && chunkDrafts.length > 0) {
     const embeddings = await embedTexts(
       embeddingConfig,

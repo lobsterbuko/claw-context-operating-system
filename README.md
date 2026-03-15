@@ -1,241 +1,141 @@
-# lossless-claw
+# CCOS - Claw Context Operating System
 
-Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://papers.voltropy.com/LCM). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
+CCOS is Ozempic for your context window. The mission is simple: make small, locally run agents feel dramatically less confused, less forgetful, less fragile under tool pressure, and much more capable over long sessions. We want a local agent to stay sharp, call tools better, execute more reliably, and keep moving without the operator reaching for `/new`. For cloud users, that also means a lot less waste: fewer useless tokens, less repeated context stuffing, and cleaner retrieval. For knowledge, the dream is very Matrix: not "the agent read a textbook in chat," but "I know kung fu" - a proper import path that installs expert knowledge as a queryable substrate the agent can reach for on demand. The long-term goal is to make a modest local model feel as close as possible to a big premium model like Claude Opus or GPT-class frontier inference, while staying local-first and operationally sane.
 
-## Table of contents
+-----------------------------------------------------------------------------
+MOST IMPORTANT THINGS CCOS CHANGES
+-----------------------------------------------------------------------------
 
-- [What it does](#what-it-does)
-- [Quick start](#quick-start)
-- [Configuration](#configuration)
-- [Ozempic — Context Management Layer](#ozempic--context-management-layer)
-- [Documentation](#documentation)
-- [Development](#development)
-- [License](#license)
+- Per-agent context policy. Each agent gets its own `context-policy.json`, so Buko, Martha, Timetrack, and Coder can all have different summary behavior, session-state rules, search models, tool compaction rules, and knowledge behavior.
+- Session-state memory. CCOS maintains a compact "what is true right now?" working document per session, so an agent can keep its bearings even when the full transcript would be too large or too messy.
+- Busy-aware model routing. Session-state and compaction work can be split across different local model lanes, with configurable `fallbackOnBusy`, `fallbackOnFailure`, and per-agent timeouts.
+- Tool-result slimming. CCOS truncates or compacts noisy tool output before it poisons the prompt, which gives small models huge context-pressure relief and makes them much better at tool use and follow-up reasoning.
+- Imported knowledge packs. Operators can ingest manuals, textbooks, reports, SOPs, or internal docs into a separate retrieval substrate, mount them to agents, and let the agent search them on demand instead of pretending it read 600 pages conversationally.
+- Runtime capability injection. Agents can be explicitly reminded, at runtime, that they have memory and knowledge tools available, what packs are mounted, and how to search them.
+- Deep observability. CCOS logs summarization, session-state, embedding, and reranker traffic to JSONL, supports session reconstruction, and now includes audit and repair flows for knowledge-pack hygiene.
 
-## What it does
+-----------------------------------------------------------------------------
+SHORT ARCHITECTURE FLOW
+-----------------------------------------------------------------------------
 
-Two ways to learn: read the below, or [check out this super cool animated visualization](https://losslesscontext.ai).
+OpenClaw runs the agent turn. `lossless-claw` provides the base DAG memory engine. CCOS sits on top of that engine and decides what to keep hot, what to compress, what to evict, what to store as session truth, what to keep in external knowledge packs, and what to retrieve back into context only when needed. The whole system is trying to do one thing well: store broadly, retrieve narrowly, and keep the active prompt lean enough for a small model to think clearly.
 
-When a conversation grows beyond the model's context window, OpenClaw (just like all of the other agents) normally truncates older messages. LCM instead:
+-----------------------------------------------------------------------------
+DETAILED ARCHITECTURE
+-----------------------------------------------------------------------------
 
-1. **Persists every message** in a SQLite database, organized by conversation
-2. **Summarizes chunks** of older messages into summaries using your configured LLM
-3. **Condenses summaries** into higher-level nodes as they accumulate, forming a DAG (directed acyclic graph)
-4. **Assembles context** each turn by combining summaries + recent raw messages
-5. **Provides tools** (`lcm_grep`, `lcm_describe`, `lcm_expand`) so agents can search and recall details from compacted history
+CCOS extends base `lossless-claw` instead of replacing it. The upstream DAG summarization layer still does the foundational work: message persistence, summary graph construction, and recall over compacted history. What CCOS adds is the operational layer that makes long-lived agents actually usable under local-model constraints. Before assembly, CCOS can run a pressure loop to compact history early instead of discovering budget overflow too late. During assembly, it can trim the fresh tail, classify tool results by provenance, evict stale observed facts after mutations, prune low-value acknowledgments, and cap giant tool outputs. After tool-heavy turns, it can generate or refresh a session-state document that acts like a compact working memory ledger: current task, active project, last error, pending follow-up, active files, and next step. That session-state block can then be injected back into later turns as a small structured stabilizer.
 
-Nothing is lost. Raw messages stay in the database. Summaries link back to their source messages. Agents can drill into any summary to recover the original detail.
+Knowledge is handled separately from lived experience. This is a core design decision. Conversation history, tool results, summaries, and session state are one kind of memory: experiential memory. Imported manuals, SOPs, reports, textbooks, and reference docs are another: installed knowledge. CCOS stores those in separate SQLite tables, chunks them, optionally embeds them, mounts them per agent, and retrieves them on demand through `lcm_knowledge_search` and `lcm_knowledge_list`. Mounted packs do not get dumped into the prompt wholesale. The agent sees only the titles and blurbs of what is available, then asks for the specific pieces it needs. That keeps the context window skinny and the agent mentally healthy.
 
-**It feels like talking to an agent that never forgets. Because it doesn't. In normal operation, you'll never need to think about compaction again.**
+-----------------------------------------------------------------------------
+WHAT IS CONFIGURABLE
+-----------------------------------------------------------------------------
 
-## Quick start
+CCOS is meant to be tuned at two levels: global runtime defaults in plugin config, and per-agent behavior in workspace policy.
 
-### Prerequisites
+Global plugin configuration lives under OpenClaw plugin config and controls the engine-wide behavior. Important knobs include:
 
-- OpenClaw with plugin context engine support
-- Node.js 22+
-- An LLM provider configured in OpenClaw (used for summarization)
+- `pressureLoop` and `pressureMaxPasses`
+- `freshTailTrimUnderPressure`
+- `provenanceTyping`
+- `provenanceEviction`
+- `summaryMode`
+- `toolResultCap`
+- `ackPruning`
+- `ackPruningMaxTokens`
+- summary-model routing and thinking controls inherited from the plugin/runtime layer
 
-### Install the plugin
+Per-agent configuration lives in `workspace-<agent>/context-policy.json`. This is where CCOS gets powerful. Current shipped policy surfaces include:
 
-Use OpenClaw's plugin installer (recommended):
+- `summaryInstructions`
+- `memory.enabled`
+- `memory.injectHint`
+- `knowledge.enabled`
+- `knowledge.injectPackList`
+- `knowledge.maxInjectedPacks`
+- `knowledge.exampleQuery`
+- `overrides.summaryMode`
+- `overrides.toolResultCap`
+- `overrides.ackPruning`
+- `overrides.ackPruningMaxTokens`
+- `toolResultCompaction.rules`
+- `toolClassification.observed`
+- `toolClassification.computed`
+- `toolClassification.mutation`
+- `freshnessTtl.default`
+- `freshnessTtl.byTool`
+- `sessionState.enabled`
+- `sessionState.maxTokens`
+- `sessionState.format`
+- `sessionState.updateOn`
+- `sessionState.schema.fields`
+- `sessionState.activityLog.enabled`
+- `sessionState.activityLog.maxEntries`
+- `sessionState.activityLog.recallHint`
+- `sessionState.provider`
+- `sessionState.model`
+- `sessionState.thinkingEnabled`
+- `sessionState.timeoutMs`
+- `sessionState.fallbackOnBusy`
+- `sessionState.fallbackOnFailure`
+- `sessionState.fallbackProvider`
+- `sessionState.fallbackModel`
+- `sessionState.routingEnabled`
+- `search.embedding.baseUrl`
+- `search.embedding.apiKey`
+- `search.embedding.model`
+- `search.embedding.dimensions`
+- `search.embedding.taskInstruction`
+- `search.reranker.baseUrl`
+- `search.reranker.apiKey`
+- `search.reranker.model`
+- `search.reranker.taskInstruction`
+- `search.reranker.maxCandidates`
+- `search.reranker.topK`
 
-```bash
-openclaw plugins install @martian-engineering/lossless-claw
-```
+Current agent examples in this install are intentionally different:
 
-If you're running from a local OpenClaw checkout, use:
+- `workspace-main` biases toward butler continuity, proactive follow-ups, and broad summary retention.
+- `workspace-martha` biases toward executive-assistant monitoring, financial/planning recall, and moderate automatic summarization.
+- `workspace-timetrack` is much more aggressive about compacting, caps tool output hard, and defaults closer to on-demand memory behavior.
+- `workspace-coder` turns on both memory and knowledge hints, uses richer session-state fields, and is tuned for coding-session recall plus knowledge-pack use.
 
-```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw
-```
+-----------------------------------------------------------------------------
+WHAT CCOS FUNCTIONALLY DOES
+-----------------------------------------------------------------------------
 
-For local plugin development, link your working copy instead of copying files:
+1. Context-pressure relief
 
-```bash
-openclaw plugins install --link /path/to/lossless-claw
-# or from a local OpenClaw checkout:
-# pnpm openclaw plugins install --link /path/to/lossless-claw
-```
+CCOS reduces active prompt bloat before the model gets buried alive. It does this with pre-assembly compaction, fresh-tail trimming, summary-mode control, acknowledgment pruning, and tool-result capping. This is the part that makes a small model feel dramatically less lost in long sessions.
 
-The install command records the plugin, enables it, and applies compatible slot selection (including `contextEngine` when applicable).
+2. Tool-output hygiene
 
-### Configure OpenClaw
+Tool outputs are where local agents often die. A giant shell log, a huge file read, an oversized search dump, or a bloated web result can eat the whole prompt and wreck the next turn. CCOS solves that with:
 
-In most cases, no manual JSON edits are needed after `openclaw plugins install`.
+- deterministic `toolResultCap` truncation
+- optional rule-based extraction in `toolResultCompaction`
+- provenance-aware interpretation of observed vs computed vs mutated state
 
-If you need to set it manually, ensure the context engine slot points at lossless-claw:
+This gives better downstream reasoning, better tool choice, and fewer nonsense follow-ups.
 
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "lossless-claw"
-    }
-  }
-}
-```
+3. Session-state working memory
 
-Restart OpenClaw after configuration changes.
+CCOS can generate a structured session-state document after tool-heavy turns. This is not a transcript and not a summary of "everything that happened." It is the compact operational answer to "what is true right now?" That distinction matters. A small local model can use a 300-450 token state block much more effectively than a slurry of old conversation.
 
-## Configuration
+4. Agent-specific summarization
 
-LCM is configured through a combination of plugin config and environment variables. Environment variables take precedence for backward compatibility.
+The summarizer can now be steered per agent with `summaryInstructions`. That means Timetrack can preserve spreadsheet anomalies and exact ranges, Buko can preserve delegated follow-ups and reminders, Martha can preserve calendar and finance commitments, and Coder can preserve file changes, commands, stack traces, and design decisions. If no custom instructions exist, CCOS falls back to its default behavior.
 
-### Plugin config
+5. Busy-aware multi-model routing
 
-Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
+CCOS assumes a split-lane local stack is normal. You may have one strong reasoning lane, one summary lane, one fallback lane, plus embedding and reranker services. Session-state work can stay on a primary model or fall back when the summary lane is busy. `fallbackOnBusy` is meant for live contention. `fallbackOnFailure` is a different switch and should be used more sparingly. This matters a lot on local boxes where one model can be perfectly healthy but simply occupied.
 
-```json
-{
-  "plugins": {
-    "entries": {
-      "lossless-claw": {
-        "enabled": true,
-        "config": {
-          "freshTailCount": 32,
-          "contextThreshold": 0.75,
-          "incrementalMaxDepth": -1
-        }
-      }
-    }
-  }
-}
-```
+6. Knowledge packs
 
-### Environment variables
+This is the imported-memory layer from the v3 work. The operator imports a file offline, CCOS extracts text, chunks it, optionally embeds it, stores it in `lcm.db`, and mounts it to one or more agents. The agent can then discover and search it. This is the "Neo learning kung fu" part of the system. The agent does not fake-read the corpus in chat. Instead, the system installs a structured retrieval substrate that the agent can consult instantly when the task calls for it.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LCM_ENABLED` | `true` | Enable/disable the plugin |
-| `LCM_DATABASE_PATH` | `~/.openclaw/lcm.db` | Path to the SQLite database |
-| `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window that triggers compaction (0.0–1.0) |
-| `LCM_FRESH_TAIL_COUNT` | `32` | Number of recent messages protected from compaction |
-| `LCM_LEAF_MIN_FANOUT` | `8` | Minimum raw messages per leaf summary |
-| `LCM_CONDENSED_MIN_FANOUT` | `4` | Minimum summaries per condensed node |
-| `LCM_CONDENSED_MIN_FANOUT_HARD` | `2` | Relaxed fanout for forced compaction sweeps |
-| `LCM_INCREMENTAL_MAX_DEPTH` | `0` | How deep incremental compaction goes (0 = leaf only, -1 = unlimited) |
-| `LCM_LEAF_CHUNK_TOKENS` | `20000` | Max source tokens per leaf compaction chunk |
-| `LCM_LEAF_TARGET_TOKENS` | `1200` | Target token count for leaf summaries |
-| `LCM_CONDENSED_TARGET_TOKENS` | `2000` | Target token count for condensed summaries |
-| `LCM_MAX_EXPAND_TOKENS` | `4000` | Token cap for sub-agent expansion queries |
-| `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
-| `LCM_LARGE_FILE_SUMMARY_PROVIDER` | `""` | Provider override for large-file summarization |
-| `LCM_LARGE_FILE_SUMMARY_MODEL` | `""` | Model override for large-file summarization |
-| `LCM_SUMMARY_MODEL` | *(from OpenClaw)* | Model for summarization (e.g. `anthropic/claude-sonnet-4-20250514`) |
-| `LCM_SUMMARY_PROVIDER` | *(from OpenClaw)* | Provider override for summarization |
-| `LCM_AUTOCOMPACT_DISABLED` | `false` | Disable automatic compaction after turns |
-| `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
-
-### Recommended starting configuration
-
-```
-LCM_FRESH_TAIL_COUNT=32
-LCM_INCREMENTAL_MAX_DEPTH=-1
-LCM_CONTEXT_THRESHOLD=0.75
-```
-
-- **freshTailCount=32** protects the last 32 messages from compaction, giving the model enough recent context for continuity.
-- **incrementalMaxDepth=-1** enables unlimited automatic condensation after each compaction pass — the DAG cascades as deep as needed. Set to `0` (default) for leaf-only, or a positive integer for a specific depth cap.
-- **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
-
-### OpenClaw session reset settings
-
-LCM preserves history through compaction, but it does **not** change OpenClaw's core session reset policy. If sessions are resetting sooner than you want, increase OpenClaw's `session.reset.idleMinutes` or use a channel/type-specific override.
-
-```json
-{
-  "session": {
-    "reset": {
-      "mode": "idle",
-      "idleMinutes": 10080
-    }
-  }
-}
-```
-
-- `session.reset.mode: "idle"` keeps a session alive until the idle window expires.
-- `session.reset.idleMinutes` is the actual reset interval in minutes.
-- OpenClaw does **not** currently enforce a maximum `idleMinutes`; in source it is validated only as a positive integer.
-- If you also use daily reset mode, `idleMinutes` acts as a secondary guard and the session resets when **either** the daily boundary or the idle window is reached first.
-- Legacy `session.idleMinutes` still works, but OpenClaw prefers `session.reset.idleMinutes`.
-
-Useful values:
-
-- `1440` = 1 day
-- `10080` = 7 days
-- `43200` = 30 days
-- `525600` = 365 days
-
-For most long-lived LCM setups, a good starting point is:
-
-```json
-{
-  "session": {
-    "reset": {
-      "mode": "idle",
-      "idleMinutes": 10080
-    }
-  }
-}
-```
-
-## Documentation
-
-- [Ozempic — Context Management Layer](#ozempic--context-management-layer)
-- [Configuration guide](docs/configuration.md)
-- [Architecture](docs/architecture.md)
-- [Agent tools](docs/agent-tools.md)
-- [TUI Reference](docs/tui.md)
-- [lcm-tui](tui/README.md)
-- [Optional: enable FTS5 for fast full-text search](docs/fts5.md)
-
-## Ozempic — Context Management Layer
-
-Ozempic is a set of context management features built into lossless-claw. Its job is to give locally-run, small-context-window language models a fighting chance at long-lived, tool-heavy agent sessions. The design goal is an agent that never needs `/new` or manual session reset, has a small organized context containing only what it needs for the current turn, and can recall historical context from the DAG on demand.
-
-All features are independently toggleable. Sensible defaults work for any agent without configuration.
-
-### Additions in this fork
-
-This fork extends Ozempic beyond the base DAG compaction layer. The focus is practical local-agent operations: better observability, stronger agent-specific policy control, safer session-state routing, and a separate imported-knowledge substrate that does not pollute experiential memory.
-
-#### Per-agent Ozempic policy
-
-Agents can now define richer behavior in `context-policy.json`, including:
-
-- `summaryInstructions` for agent-specific summarizer behavior
-- session-state routing controls such as `timeoutMs`, `fallbackOnBusy`, and `fallbackOnFailure`
-- explicit memory and knowledge capability switches:
-  - `memory.enabled`
-  - `memory.injectHint`
-  - `knowledge.enabled`
-  - `knowledge.injectPackList`
-  - `knowledge.maxInjectedPacks`
-  - `knowledge.exampleQuery`
-
-These controls let an agent expose only the memory/knowledge surfaces it should actually use.
-
-#### Runtime memory and knowledge hints
-
-Ozempic can now inject compact runtime guidance into the system prompt:
-
-- when memory is enabled, the agent gets a short hint that LCM recall tools exist and when to use them
-- when knowledge is enabled, the agent gets a short mounted-pack title list plus an example `lcm_knowledge_search` query
-
-This keeps dynamic capability facts in runtime injection instead of relying only on workspace prose.
-
-#### Knowledge Packs
-
-Knowledge Packs are a separate imported-knowledge layer inside `lcm.db`.
-
-- stored separately from conversation summaries
-- mounted per agent
-- retrieved on demand with `lcm_knowledge_search`
-- discoverable with `lcm_knowledge_list`
-- imported offline by an operator, not by agents
-
-Current import formats:
+Supported import formats in the current implementation:
 
 - `txt`
 - `md`
@@ -248,357 +148,63 @@ Current import formats:
 - `rtfd`
 - `pdf`
 
-Operator admin flow:
+Current operator workflow:
 
 ```bash
-npm run knowledge:admin -- import --agent coder --pack-id coder-openclaw-system-v1 --file /absolute/path/to/file.md
+npm run knowledge:admin -- import --agent coder --pack-id my-pack --file /absolute/path/to/file.md
+npm run knowledge:admin -- mount --agent coder --pack-id my-pack
 npm run knowledge:admin -- list --agent coder
-npm run knowledge:admin -- mount --agent coder --pack-id coder-openclaw-system-v1
-npm run knowledge:admin -- unmount --agent coder --pack-id coder-openclaw-system-v1
+npm run knowledge:admin -- audit --pack-id my-pack
+npm run knowledge:admin -- repair --agent coder --pack-id my-pack
+npm run knowledge:admin -- unmount --agent coder --pack-id my-pack
 ```
 
-#### LLM usage logging
+The new `audit` and `repair` commands exist because real systems get messy. Imports can be interrupted. SQLite can get locked. A pack can be imported twice. CCOS now has operator tools to detect duplicate docs, partial embeddings, and repair them instead of shrugging and hoping retrieval still works.
 
-This fork adds append-only JSONL logging for internal LCM model traffic:
+7. Runtime memory / knowledge reminders
 
-- summary model calls
-- session-state model calls
-- embedding requests
-- reranker requests
+CCOS can inject runtime hints into the system prompt so the agent knows, explicitly, that it has memory and knowledge available. For knowledge, it can inject a short mounted-pack list and an example search query. For memory, it can inject a compact reminder that LCM recall tools exist and when to use them. This keeps capability knowledge dynamic instead of burying it only in workspace prose.
 
-The intent is operational debugging, soak-test forensics, and visibility into what the local model lanes are doing.
+8. Observability and forensics
 
-#### Session-state routing
+CCOS writes append-only JSONL logs for:
 
-Session-state updates now support a more deliberate model-routing policy:
+- summarization calls
+- session-state calls
+- embedding calls
+- reranker calls
 
-- primary model can remain the stronger local lane
-- `fallbackOnBusy` proactively routes around known summary-lane contention
-- `fallbackOnFailure` can be enabled selectively per agent
-- long timeout behavior is configurable per agent
+Those live in `~/.openclaw/usage-logs/lcm-llm-usage.jsonl`. We also added session reconstruction so raw OpenClaw session JSONLs can be turned into readable per-session markdown logs. Between the session transcript and the LLM usage log, you can answer the important operational questions:
 
-This makes session-state behavior tunable for agents where continuity is critical versus agents where it is optional.
+- What did the agent actually do?
+- What model did CCOS call?
+- What raw request was sent?
+- Did the call complete, fail, or time out?
+- Did the agent use memory, knowledge, web search, or just freestyle?
 
-### Tier 1 — Engine features
+-----------------------------------------------------------------------------
+CURRENT REAL-WORLD SHAPE OF THE STACK
+-----------------------------------------------------------------------------
 
-Core context management mechanics. Always beneficial. Configured in `plugins.entries.lossless-claw.config`.
+In the current installation this fork has been living in, the system has been run as a split local stack:
 
-| Feature | Config key | Default | Description |
-|---------|-----------|---------|-------------|
-| Pre-assembly pressure loop | `pressureLoop` | `true` | Runs compaction passes before assembly when context exceeds budget, rather than discovering the problem after |
-| Pressure max passes | `pressureMaxPasses` | `3` | Maximum compaction passes in the pressure loop |
-| Fresh tail trimming | `freshTailTrimUnderPressure` | `true` | Trims oldest fresh-tail messages instead of overflowing when the tail alone exceeds the token budget |
-| Provenance typing | `provenanceTyping` | `true` | Classifies tool results as `observed`, `computed`, or `mutation` based on tool name and content |
-| Provenance-aware eviction | `provenanceEviction` | `true` | Evicts stale `observed` results after a `mutation` to the same resource |
+- a large reasoning lane for main agent turns
+- a 9B summary/session-state lane
+- a 4B fallback lane for selective session-state routing
+- local embedding and reranker services for memory and knowledge retrieval
 
-### Tier 2 — Heuristic features
+The important design point is not the exact model names. The important design point is that CCOS expects this kind of local heterogeneity and gives you knobs to route around it instead of pretending one single model should do every job.
 
-Domain-agnostic heuristics that improve context quality. Configured in `plugins.entries.lossless-claw.config`.
+-----------------------------------------------------------------------------
+WHY THIS EXISTS AT ALL
+-----------------------------------------------------------------------------
 
-| Feature | Config key | Default | Description |
-|---------|-----------|---------|-------------|
-| Acknowledgment pruning | `ackPruning` | `false` | Removes low-value conversational exchanges ("ok thanks" / "You're welcome!") from assembled context |
-| Ack pruning threshold | `ackPruningMaxTokens` | `30` | Messages under this token count with no tool calls are ack candidates |
-| Summary inclusion mode | `summaryMode` | `"auto"` | `"always"` = include summaries, `"on-demand"` = exclude (use recall tools), `"auto"` = include when under 50% budget |
-| Tool result size cap | `toolResultCap` | `400` | Truncates individual tool results exceeding this token count. `0` = unlimited |
-| Reasoning trace handling | `reasoningTraceMode` | `"drop"` | `"drop"` = remove previous-turn reasoning traces, `"keep"` = preserve them |
+The whole point of CCOS is to make a small local agent stop acting small. Less confusion. Less context poisoning. Better tool calls. Better continuity. Better recovery after long sessions. Better use of narrow prompts. Better handling of giant tool output. Much better access to installed expert knowledge. Lower token waste. Fewer operator resets. No more living in fear of `/new`.
 
-### Tier 3 — Agent-specific policies
+That is the dream.
 
-Powerful features that require per-agent configuration. Defined in `context-policy.json` in the agent's workspace directory (e.g., `~/.openclaw/workspace-timetrack/context-policy.json`). All off by default.
+Not a demo.
+Not a toy.
+Not "memory" in the vague marketing sense.
 
-#### Tool result compaction rules
-
-Extract specific fields from tool results instead of blind truncation. For example, keep only `day`, `start`, `end`, and `total` from a spreadsheet read:
-
-```json
-{
-  "toolResultCompaction": {
-    "rules": [
-      {
-        "toolNamePattern": "sheets_cli.py.*read",
-        "extractFields": ["day", "start", "end", "total"],
-        "maxTokens": 150
-      }
-    ]
-  }
-}
-```
-
-#### Custom tool classification
-
-Override the heuristic provenance classifier with explicit tool-to-provenance mappings:
-
-```json
-{
-  "toolClassification": {
-    "observed": ["read-day", "read-week", "metadata"],
-    "computed": ["calc", "aggregate-days"],
-    "mutation": ["write-row", "set-day-shift"]
-  }
-}
-```
-
-#### Freshness TTL
-
-Time-based eviction for `observed` results, even without a subsequent `mutation`:
-
-```json
-{
-  "freshnessTtl": {
-    "default": 300,
-    "byTool": { "get-quote": 30, "read-day": 300 }
-  }
-}
-```
-
-#### Session state document
-
-A small structured working memory document updated after mutation-provenance turns and injected into the assembled context. Provides the model with a concise, always-current snapshot of domain state — replacing hundreds of tokens of summary archaeology with 50–200 tokens of structured truth.
-
-**What the model sees in context:**
-
-```
-[Session State]
-Active sheet: March 2026
-PTO balance: 7.5 hours
-Last operation: updated March 24 to 8:30 AM - 3:00 PM
-Known anomalies: day 24 appears twice (rows 23 and 31)
-Notes: User prefers 24-hour time format
-
-[Recent Activity]  — lcm_grep("<timestamp or keyword>") for full context
-2:30 PM — Updated March 24 clock-out to 3:00 PM
-2:15 PM — Read March 23 (8:30 AM - 5:00 PM, confirmed correct)
-1:50 PM — Updated PTO balance from 8.0 to 7.5 hours
-```
-
-The activity log timestamps match the format used in DAG summaries (same timezone), so the model can cross-reference entries with summaries and use `lcm_grep` to drill into any entry for full detail. This turns the activity log into a temporal index — the model scans the log, decides if the one-liner is enough context, and only calls recall tools when it needs depth.
-
-**Configuration:**
-
-```json
-{
-  "sessionState": {
-    "enabled": true,
-    "maxTokens": 300,
-    "format": "hybrid",
-    "updateOn": "mutation",
-    "schema": {
-      "fields": [
-        {"name": "activeSheet", "label": "Active sheet"},
-        {"name": "ptoBalance", "label": "PTO balance"},
-        {"name": "lastOperation", "label": "Last operation"},
-        {"name": "knownAnomalies", "label": "Known anomalies"}
-      ]
-    },
-    "activityLog": {
-      "enabled": true,
-      "maxEntries": 10,
-      "recallHint": true
-    }
-  }
-}
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `enabled` | boolean | `false` | Enable session state |
-| `maxTokens` | integer | `300` | Hard cap on state doc tokens; subtracted from assembly budget |
-| `format` | string | `"hybrid"` | `"structured"` = named fields only, `"hybrid"` = named fields + freeform `_notes` |
-| `updateOn` | string | `"mutation"` | `"mutation"` = update after mutations only, `"any-tool"` = update after any tool call |
-| `schema.fields` | array | `[]` | Field definitions: `name` (JSON key), `label` (rendered in context), optional `description` (hint to update model about what belongs in the field) |
-| `activityLog.enabled` | boolean | `true` | Rolling activity log with timestamps |
-| `activityLog.maxEntries` | integer | `10` | Max log entries before oldest rolls off |
-| `activityLog.recallHint` | boolean | `true` | Add `lcm_grep(...)` hint in log header |
-| `model` | string | *(summaryModel)* | Primary model for session state updates — separates it from compaction on the same model |
-| `provider` | string | *(summaryProvider)* | Provider for the primary session state model |
-| `thinkingEnabled` | boolean | `false` | Enable extended thinking for the session state model (recommended for small models doing complex field extraction) |
-| `fallbackModel` | string | — | Fallback model used when the primary is busy with compaction (compaction-aware router) |
-| `fallbackProvider` | string | — | Provider for the fallback model |
-| `routingEnabled` | boolean | `true` | Enable/disable compaction-aware routing. When `true` (default) and a fallback model is configured, session state calls route to the fallback whenever compaction is in flight. Set to `false` to always use the primary model (updates may queue behind compaction) or to temporarily disable routing without removing the fallback config |
-
-The state document is persisted to the LCM SQLite database and survives gateway restarts. Updates are fail-open — if the summary model returns garbage, the previous state is kept.
-
-### Compaction-aware routing (poor man's router)
-
-When running multiple local models, compaction and session state updates can contend for the same GPU. The compaction-aware router solves this by detecting when compaction is in flight and routing session state calls to a fallback model instead.
-
-**How it works:**
-
-1. The engine tracks a `compactionInFlight` counter, incremented when any compaction pass starts and decremented when it finishes.
-2. When `maybeUpdateSessionState` fires, it checks the counter:
-   - Counter is 0 (compaction idle) → use the primary model (`model`/`provider`)
-   - Counter > 0 (compaction running) → use the fallback model (`fallbackModel`/`fallbackProvider`)
-3. If the counter > 0 and no fallback is configured, the session state update is **skipped** for that turn (fail-open — better than queuing behind a 60-120s compaction call).
-
-**Recommended setup for a three-model cluster:**
-
-```json
-{
-  "sessionState": {
-    "provider": "mac-mini-9b",
-    "model": "Qwen3.5-9B",
-    "fallbackProvider": "mac-studio-4b",
-    "fallbackModel": "Qwen3.5-4B",
-    "routingEnabled": true
-  }
-}
-```
-
-This keeps compaction (always 9B) and session state (9B when free, 4B when 9B is busy) separated from the main inference model. The 4B fallback handles the edge case where compaction and a session state update would otherwise collide.
-
-**To disable routing** without removing the fallback config: set `"routingEnabled": false`. Session state calls will always go to the primary model. If that model is busy with compaction, the update will queue or timeout (30s backstop).
-
-**To disable session state when primary is busy** without a fallback: omit `fallbackModel`. The engine will skip the update when compaction is in flight.
-
-### Model tuning recommendations
-
-Three-model setup (main inference + compaction + session state):
-
-| Model role | Recommended settings | Why |
-|------------|---------------------|-----|
-| **Main inference** (27B+) | `temperature: 0.6`, `top_p: 0.95`, `min_p: 0.05` | Thinking handles structured reasoning; slight temperature keeps responses natural |
-| **Compaction/summarization** (9B) | `temperature: 0`, `top_p: 1.0`, thinking off | Summaries should be deterministic and faithful — zero temperature, no creativity |
-| **Session state** (4B) | `temperature: 0.5` with thinking on, or `temperature: 0` without | Thinking benefits from exploration; the strict JSON prompt constrains the output regardless |
-
-With thinking enabled on the session state model (`"thinkingEnabled": true` in context-policy.json), lossless-claw automatically uses `temperature: 0.5` for that call. All other model parameters (`top_p`, `min_p`, `repetition_penalty`) are controlled by your provider's server configuration.
-
-### Context manifests
-
-On every assembly, Ozempic writes a manifest file recording exactly what went into the model prompt. Manifests are written to `~/.openclaw/aeon/manifests/<sessionId>.latest.json` and include provenance metadata, Ozempic feature flags, and assembly statistics. They are a forensic/debugging tool — the model never sees them.
-
-### Configuration example
-
-A complete Ozempic configuration for a timetrack agent:
-
-```json
-{
-  "plugins": {
-    "entries": {
-      "lossless-claw": {
-        "config": {
-          "freshTailCount": 8,
-          "contextThreshold": 0.40,
-          "pressureLoop": true,
-          "pressureMaxPasses": 3,
-          "freshTailTrimUnderPressure": true,
-          "provenanceTyping": true,
-          "provenanceEviction": true,
-          "summaryMode": "auto",
-          "toolResultCap": 400,
-          "reasoningTraceMode": "drop",
-          "ackPruning": false,
-          "ackPruningMaxTokens": 30
-        }
-      }
-    }
-  }
-}
-```
-
-With a per-agent policy in `~/.openclaw/workspace-timetrack/context-policy.json`:
-
-```json
-{
-  "overrides": {
-    "summaryMode": "on-demand",
-    "toolResultCap": 200,
-    "ackPruning": true
-  },
-  "sessionState": {
-    "enabled": true,
-    "maxTokens": 300,
-    "format": "hybrid",
-    "updateOn": "mutation",
-    "schema": {
-      "fields": [
-        {"name": "activeSheet", "label": "Active sheet"},
-        {"name": "ptoBalance", "label": "PTO balance"},
-        {"name": "lastOperation", "label": "Last operation"},
-        {"name": "knownAnomalies", "label": "Known anomalies"}
-      ]
-    },
-    "activityLog": {
-      "enabled": true,
-      "maxEntries": 10,
-      "recallHint": true
-    }
-  },
-  "toolClassification": {
-    "observed": ["read-day", "read-week", "metadata"],
-    "mutation": ["write-row", "set-day-shift"]
-  },
-  "freshnessTtl": {
-    "default": 300
-  }
-}
-```
-
-For the full design document, see [Ozempic v2 plan](../ozempic_v2_plan.md).
-
-## Development
-
-```bash
-# Run tests
-npx vitest
-
-# Type check
-npx tsc --noEmit
-
-# Run a specific test file
-npx vitest test/engine.test.ts
-```
-
-### Project structure
-
-```
-index.ts                    # Plugin entry point and registration
-src/
-  engine.ts                 # LcmContextEngine — implements ContextEngine interface
-  assembler.ts              # Context assembly (summaries + messages → model context)
-  compaction.ts             # CompactionEngine — leaf passes, condensation, sweeps
-  summarize.ts              # Depth-aware prompt generation and LLM summarization
-  context-manifest.ts       # Provenance types, manifest schema, and file writer
-  context-policy.ts         # Per-agent policy loader and Tier 3 feature logic
-  session-state.ts          # Session state persistence and update logic
-  retrieval.ts              # RetrievalEngine — grep, describe, expand operations
-  expansion.ts              # DAG expansion logic for lcm_expand_query
-  expansion-auth.ts         # Delegation grants for sub-agent expansion
-  expansion-policy.ts       # Depth/token policy for expansion
-  large-files.ts            # File interception, storage, and exploration summaries
-  integrity.ts              # DAG integrity checks and repair utilities
-  transcript-repair.ts      # Tool-use/result pairing sanitization
-  types.ts                  # Core type definitions (dependency injection contracts)
-  openclaw-bridge.ts        # Bridge utilities
-  db/
-    config.ts               # LcmConfig resolution from env vars
-    connection.ts           # SQLite connection management
-    migration.ts            # Schema migrations
-  store/
-    conversation-store.ts   # Message persistence and retrieval
-    summary-store.ts        # Summary DAG persistence and context item management
-    fts5-sanitize.ts        # FTS5 query sanitization
-  tools/
-    lcm-grep-tool.ts        # lcm_grep tool implementation
-    lcm-describe-tool.ts    # lcm_describe tool implementation
-    lcm-expand-tool.ts      # lcm_expand tool (sub-agent only)
-    lcm-expand-query-tool.ts # lcm_expand_query tool (main agent wrapper)
-    lcm-conversation-scope.ts # Conversation scoping utilities
-    common.ts               # Shared tool utilities
-test/                       # Vitest test suite
-specs/                      # Design specifications
-openclaw.plugin.json        # Plugin manifest with config schema and UI hints
-tui/                        # Interactive terminal UI (Go)
-  main.go                   # Entry point and bubbletea app
-  data.go                   # Data loading and SQLite queries
-  dissolve.go               # Summary dissolution
-  repair.go                 # Corrupted summary repair
-  rewrite.go                # Summary re-summarization
-  transplant.go             # Cross-conversation DAG copy
-  prompts/                  # Depth-aware prompt templates
-.goreleaser.yml             # GoReleaser config for TUI binary releases
-```
-
-## License
-
-MIT
+A real context operating system for agents.

@@ -41,6 +41,16 @@ export type KnowledgeDocumentRecord = {
   createdAt: Date;
 };
 
+export type KnowledgeDocumentEmbeddingStatus = {
+  documentId: string;
+  packId: string;
+  title: string | null;
+  sourcePath: string | null;
+  contentHash: string;
+  chunkCount: number;
+  embeddedChunkCount: number;
+};
+
 export type CreateKnowledgeDocumentInput = {
   documentId: string;
   packId: string;
@@ -135,6 +145,16 @@ interface KnowledgeDocumentRow {
   created_at: string;
 }
 
+interface KnowledgeDocumentEmbeddingStatusRow {
+  document_id: string;
+  pack_id: string;
+  title: string | null;
+  source_path: string | null;
+  content_hash: string;
+  chunk_count: number;
+  embedded_chunk_count: number;
+}
+
 interface KnowledgeChunkRow {
   chunk_id: string;
   pack_id: string;
@@ -199,6 +219,20 @@ function toKnowledgeDocumentRecord(row: KnowledgeDocumentRow): KnowledgeDocument
     contentHash: row.content_hash,
     metadataJson: row.metadata_json,
     createdAt: new Date(row.created_at),
+  };
+}
+
+function toKnowledgeDocumentEmbeddingStatus(
+  row: KnowledgeDocumentEmbeddingStatusRow,
+): KnowledgeDocumentEmbeddingStatus {
+  return {
+    documentId: row.document_id,
+    packId: row.pack_id,
+    title: row.title,
+    sourcePath: row.source_path,
+    contentHash: row.content_hash,
+    chunkCount: row.chunk_count,
+    embeddedChunkCount: row.embedded_chunk_count,
   };
 }
 
@@ -332,6 +366,37 @@ export class KnowledgeStore {
     return rows.map(toKnowledgeDocumentRecord);
   }
 
+  findDocumentsBySource(
+    packId: string,
+    sourcePath: string | null,
+    contentHash: string,
+  ): KnowledgeDocumentRecord[] {
+    const rows = this.db.prepare(`
+      SELECT document_id, pack_id, title, source_path, source_url, mime_type,
+             byte_size, content_hash, metadata_json, created_at
+      FROM knowledge_documents
+      WHERE pack_id = ?
+        AND content_hash = ?
+        AND (
+          (? IS NULL AND source_path IS NULL)
+          OR source_path = ?
+        )
+      ORDER BY created_at ASC, document_id ASC
+    `).all(packId, contentHash, sourcePath, sourcePath) as KnowledgeDocumentRow[];
+    return rows.map(toKnowledgeDocumentRecord);
+  }
+
+  listChunksForDocument(documentId: string): KnowledgeChunkRecord[] {
+    const rows = this.db.prepare(`
+      SELECT chunk_id, pack_id, document_id, ordinal, heading, section_path,
+             content, token_count, char_count, metadata_json, created_at
+      FROM knowledge_chunks
+      WHERE document_id = ?
+      ORDER BY ordinal ASC
+    `).all(documentId) as KnowledgeChunkRow[];
+    return rows.map(toKnowledgeChunkRecord);
+  }
+
   insertChunk(input: CreateKnowledgeChunkInput): void {
     this.db.prepare(`
       INSERT OR REPLACE INTO knowledge_chunks (
@@ -425,6 +490,47 @@ export class KnowledgeStore {
       content: row.content,
       embedding: row.embedding,
     }));
+  }
+
+  countEmbeddedChunksForDocument(documentId: string, model: string): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM knowledge_chunks c
+      JOIN knowledge_chunk_embeddings e
+        ON e.chunk_id = c.chunk_id
+      WHERE c.document_id = ? AND e.model = ?
+    `).get(documentId, model) as { count: number } | undefined;
+    return row?.count ?? 0;
+  }
+
+  listDocumentEmbeddingStatus(packId?: string, model?: string): KnowledgeDocumentEmbeddingStatus[] {
+    const rows = this.db.prepare(`
+      SELECT d.document_id, d.pack_id, d.title, d.source_path, d.content_hash,
+             COUNT(c.chunk_id) AS chunk_count,
+             SUM(
+               CASE
+                 WHEN e.chunk_id IS NOT NULL AND (? IS NULL OR e.model = ?)
+                 THEN 1
+                 ELSE 0
+               END
+             ) AS embedded_chunk_count
+      FROM knowledge_documents d
+      LEFT JOIN knowledge_chunks c
+        ON c.document_id = d.document_id
+      LEFT JOIN knowledge_chunk_embeddings e
+        ON e.chunk_id = c.chunk_id
+      WHERE (? IS NULL OR d.pack_id = ?)
+      GROUP BY d.document_id, d.pack_id, d.title, d.source_path, d.content_hash
+      ORDER BY d.pack_id ASC, d.created_at ASC, d.document_id ASC
+    `).all(model ?? null, model ?? null, packId ?? null, packId ?? null) as KnowledgeDocumentEmbeddingStatusRow[];
+    return rows.map(toKnowledgeDocumentEmbeddingStatus);
+  }
+
+  deleteDocument(documentId: string): void {
+    this.db.prepare(`
+      DELETE FROM knowledge_documents
+      WHERE document_id = ?
+    `).run(documentId);
   }
 
   mountPack(params: {

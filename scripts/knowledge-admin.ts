@@ -7,9 +7,10 @@ import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { importKnowledgeFile } from "../src/knowledge-import.js";
+import { embedTexts, serializeEmbedding } from "../src/semantic-search.js";
 import { KnowledgeStore } from "../src/store/knowledge-store.js";
 
-type Command = "import" | "mount" | "unmount" | "list";
+type Command = "import" | "mount" | "unmount" | "list" | "audit" | "repair";
 
 type ParsedArgs = {
   command: Command;
@@ -18,9 +19,16 @@ type ParsedArgs = {
 
 function parseArgs(argv: string[]): ParsedArgs {
   const [commandRaw, ...rest] = argv;
-  if (commandRaw !== "import" && commandRaw !== "mount" && commandRaw !== "unmount" && commandRaw !== "list") {
+  if (
+    commandRaw !== "import" &&
+    commandRaw !== "mount" &&
+    commandRaw !== "unmount" &&
+    commandRaw !== "list" &&
+    commandRaw !== "audit" &&
+    commandRaw !== "repair"
+  ) {
     throw new Error(
-      "Usage: knowledge-admin <import|mount|unmount|list> [--agent <id>] [--pack-id <id>] [--file <path>]",
+      "Usage: knowledge-admin <import|mount|unmount|list|audit|repair> [--agent <id>] [--pack-id <id>] [--file <path>]",
     );
   }
 
@@ -105,6 +113,40 @@ function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+async function reembedDocument(params: {
+  store: KnowledgeStore;
+  searchConfig: ReturnType<typeof loadAgentSearchConfig>;
+  documentId: string;
+}): Promise<{ chunkCount: number; embeddedChunkCount: number }> {
+  const embeddingConfig = params.searchConfig?.embedding ?? null;
+  const chunks = params.store.listChunksForDocument(params.documentId);
+  if (!embeddingConfig || chunks.length === 0) {
+    return { chunkCount: chunks.length, embeddedChunkCount: 0 };
+  }
+  const embeddings = await embedTexts(
+    embeddingConfig,
+    chunks.map((chunk) => chunk.content),
+  );
+  if (embeddings && embeddings.length === chunks.length) {
+    for (let i = 0; i < embeddings.length; i++) {
+      params.store.storeChunkEmbedding(
+        chunks[i].chunkId,
+        embeddingConfig.model,
+        embeddings[i].length,
+        serializeEmbedding(embeddings[i]),
+      );
+    }
+    return { chunkCount: chunks.length, embeddedChunkCount: embeddings.length };
+  }
+  return {
+    chunkCount: chunks.length,
+    embeddedChunkCount: params.store.countEmbeddedChunksForDocument(
+      params.documentId,
+      embeddingConfig.model,
+    ),
+  };
+}
+
 async function run(): Promise<void> {
   const { command, flags } = parseArgs(process.argv.slice(2));
   const openclawRoot = resolveOpenClawRoot(flags);
@@ -126,6 +168,7 @@ async function run(): Promise<void> {
         params: {
           agentId,
           packId,
+          packName: readFlag(flags, "pack-name"),
           filePath,
           title: readFlag(flags, "title"),
           description: readFlag(flags, "description"),
@@ -138,6 +181,78 @@ async function run(): Promise<void> {
         },
       });
       printJson({ ok: true, agentId, ...result });
+      return;
+    }
+
+    if (command === "audit") {
+      const packId = readFlag(flags, "pack-id");
+      const embeddingModel =
+        readFlag(flags, "embedding-model") ??
+        undefined;
+      const statuses = store.listDocumentEmbeddingStatus(packId, embeddingModel);
+      const duplicates = new Map<string, typeof statuses>();
+      for (const status of statuses) {
+        const key = `${status.packId}::${status.sourcePath ?? ""}::${status.contentHash}`;
+        duplicates.set(key, [...(duplicates.get(key) ?? []), status]);
+      }
+      const duplicateGroups = [...duplicates.values()].filter((group) => group.length > 1);
+      const partialEmbeddings = statuses.filter(
+        (status) => status.chunkCount > 0 && status.embeddedChunkCount < status.chunkCount,
+      );
+      printJson({
+        ok: true,
+        packId: packId ?? null,
+        documentCount: statuses.length,
+        duplicateGroups,
+        partialEmbeddings,
+      });
+      return;
+    }
+
+    if (command === "repair") {
+      const agentId = normalizeAgentId(requireFlag(flags, "agent"));
+      const packId = requireFlag(flags, "pack-id");
+      const searchConfig = loadAgentSearchConfig(openclawRoot, agentId);
+      const statuses = store.listDocumentEmbeddingStatus(packId, searchConfig?.embedding?.model);
+      const grouped = new Map<string, typeof statuses>();
+      for (const status of statuses) {
+        const key = `${status.packId}::${status.sourcePath ?? ""}::${status.contentHash}`;
+        grouped.set(key, [...(grouped.get(key) ?? []), status]);
+      }
+
+      const repaired: Array<{ documentId: string; chunkCount: number; embeddedChunkCount: number }> = [];
+      const removed: string[] = [];
+
+      for (const group of grouped.values()) {
+        const ranked = [...group].sort((a, b) => {
+          if (b.embeddedChunkCount !== a.embeddedChunkCount) {
+            return b.embeddedChunkCount - a.embeddedChunkCount;
+          }
+          if (b.chunkCount !== a.chunkCount) {
+            return b.chunkCount - a.chunkCount;
+          }
+          return a.documentId.localeCompare(b.documentId);
+        });
+        const keep = ranked[0];
+        const repairResult = await reembedDocument({
+          store,
+          searchConfig,
+          documentId: keep.documentId,
+        });
+        repaired.push({ documentId: keep.documentId, ...repairResult });
+        for (const duplicate of ranked.slice(1)) {
+          store.deleteDocument(duplicate.documentId);
+          removed.push(duplicate.documentId);
+        }
+      }
+
+      printJson({
+        ok: true,
+        agentId,
+        packId,
+        repaired,
+        removed,
+      });
       return;
     }
 
