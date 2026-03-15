@@ -1,5 +1,6 @@
 import { appendFileSync } from "fs";
-import type { LcmDependencies } from "./types.js";
+import { createUsageLogRequestId, writeLlmUsageLog } from "./llm-usage-log.js";
+import type { CompletionResult, LcmDependencies } from "./types.js";
 
 export type LcmSummarizeOptions = {
   previousSummary?: string;
@@ -738,36 +739,74 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           previousSummary: options?.previousSummary,
           customInstructions: params.customInstructions,
         });
+    const requestId = createUsageLogRequestId();
+    const rawRequest = {
+      provider,
+      model,
+      apiKey,
+      providerApi,
+      authProfileId,
+      agentDir,
+      runtimeConfig: params.legacyParams.config,
+      system: LCM_SUMMARIZER_SYSTEM_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      maxTokens: targetTokens,
+      temperature: aggressive ? 0.1 : 0.2,
+      extraBody,
+    };
+    writeLlmUsageLog({
+      ts: new Date().toISOString(),
+      status: "started",
+      subsystem: "summarize",
+      provider,
+      model,
+      requestId,
+      request: rawRequest,
+    });
 
     const t0 = Date.now();
     const SUMMARY_TIMEOUT_MS = 120_000;
-    const result = await Promise.race([
-      params.deps.complete({
+    let result: CompletionResult;
+    try {
+      result = await Promise.race([
+        params.deps.complete(rawRequest),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`summary model timed out after ${SUMMARY_TIMEOUT_MS}ms`)),
+            SUMMARY_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+      writeLlmUsageLog({
+        ts: new Date().toISOString(),
+        status: "completed",
+        subsystem: "summarize",
         provider,
         model,
-        apiKey,
-        providerApi,
-        authProfileId,
-        agentDir,
-        runtimeConfig: params.legacyParams.config,
-        system: LCM_SUMMARIZER_SYSTEM_PROMPT,
-        messages: [
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-        maxTokens: targetTokens,
-        temperature: aggressive ? 0.1 : 0.2,
-        extraBody,
-      }),
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`summary model timed out after ${SUMMARY_TIMEOUT_MS}ms`)),
-          SUMMARY_TIMEOUT_MS,
-        ),
-      ),
-    ]);
+        requestId,
+        request: rawRequest,
+        response: result,
+        durationMs: Date.now() - t0,
+      });
+    } catch (err) {
+      writeLlmUsageLog({
+        ts: new Date().toISOString(),
+        status: "failed",
+        subsystem: "summarize",
+        provider,
+        model,
+        requestId,
+        request: rawRequest,
+        error: err instanceof Error ? err.message : String(err),
+        durationMs: Date.now() - t0,
+      });
+      throw err;
+    }
     if (debugLogPath) {
       writeSummaryDebugEntry(debugLogPath, {
         ts: new Date().toISOString(),
@@ -827,37 +866,59 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       // Single retry with conservative parameters: low temperature and low
       // reasoning budget to coax a textual response from providers that
       // sometimes return reasoning-only or empty blocks on the first pass.
+      const retryRequestId = createUsageLogRequestId();
+      const retryRequest = {
+        provider,
+        model,
+        apiKey,
+        providerApi,
+        authProfileId,
+        agentDir,
+        runtimeConfig: params.legacyParams.config,
+        system: LCM_SUMMARIZER_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        maxTokens: targetTokens,
+        temperature: 0.05,
+        reasoning: "low",
+        extraBody,
+      };
       try {
         const tRetry = Date.now();
-      const RETRY_TIMEOUT_MS = 60_000;
-      const retryResult = await Promise.race([
-        params.deps.complete({
+        const RETRY_TIMEOUT_MS = 60_000;
+        writeLlmUsageLog({
+          ts: new Date().toISOString(),
+          status: "started",
+          subsystem: "summarize",
           provider,
           model,
-          apiKey,
-          providerApi,
-          authProfileId,
-          agentDir,
-          runtimeConfig: params.legacyParams.config,
-          system: LCM_SUMMARIZER_SYSTEM_PROMPT,
-          messages: [
-            {
-              role: "user",
-              content: prompt,
-            },
-          ],
-          maxTokens: targetTokens,
-          temperature: 0.05,
-          reasoning: "low",
-          extraBody,
-        }),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`summary model retry timed out after ${RETRY_TIMEOUT_MS}ms`)),
-            RETRY_TIMEOUT_MS,
+          requestId: retryRequestId,
+          request: retryRequest,
+        });
+        const retryResult = await Promise.race([
+          params.deps.complete(retryRequest),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`summary model retry timed out after ${RETRY_TIMEOUT_MS}ms`)),
+              RETRY_TIMEOUT_MS,
+            ),
           ),
-        ),
-      ]);
+        ]);
+        writeLlmUsageLog({
+          ts: new Date().toISOString(),
+          status: "completed",
+          subsystem: "summarize",
+          provider,
+          model,
+          requestId: retryRequestId,
+          request: retryRequest,
+          response: retryResult,
+          durationMs: Date.now() - tRetry,
+        });
         if (debugLogPath) {
           writeSummaryDebugEntry(debugLogPath, {
             ts: new Date().toISOString(),
@@ -904,6 +965,16 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           console.error(`${retryParts.join("; ")}; falling back to truncation`);
         }
       } catch (retryErr) {
+        writeLlmUsageLog({
+          ts: new Date().toISOString(),
+          status: "failed",
+          subsystem: "summarize",
+          provider,
+          model,
+          requestId: retryRequestId,
+          request: retryRequest,
+          error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+        });
         // Retry is best-effort; log and proceed to deterministic fallback.
         console.error(
           `[lcm] retry failed; provider=${provider} model=${model}; error=${

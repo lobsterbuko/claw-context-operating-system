@@ -18,6 +18,12 @@ export interface ContextPolicy {
   /** Tier 1/2 config overrides (handled by engine config resolution, not here). */
   overrides?: Record<string, unknown>;
 
+  /**
+   * Optional per-agent instructions injected into the Ozempic summarizer prompt.
+   * When omitted, the summarizer falls back to the default built-in prompt language.
+   */
+  summaryInstructions?: string;
+
   toolResultCompaction?: {
     rules: ToolResultCompactionRule[];
   };

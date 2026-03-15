@@ -8,6 +8,7 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
+import { createUsageLogRequestId, writeLlmUsageLog } from "./llm-usage-log.js";
 import type { CompleteFn } from "./types.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -54,6 +55,18 @@ export interface SessionStateConfig {
    */
   fallbackModel?: string;
   fallbackProvider?: string;
+  /** Timeout for one session-state model attempt. Defaults to 180000ms. */
+  timeoutMs?: number;
+  /**
+   * When true, route directly to fallback model when the primary summary lane is busy.
+   * Defaults to true when a fallback model/provider is configured.
+   */
+  fallbackOnBusy?: boolean;
+  /**
+   * When true, retry on the fallback model after a primary-model failure or timeout.
+   * Defaults to false.
+   */
+  fallbackOnFailure?: boolean;
   /**
    * Enable compaction-aware routing: route session state to fallbackModel when
    * compaction is in flight, primary model otherwise.
@@ -138,6 +151,21 @@ export function resolveSessionStateConfig(raw: unknown): SessionStateConfig | nu
   }
   if (typeof r.fallbackProvider === "string" && r.fallbackProvider.trim()) {
     config.fallbackProvider = r.fallbackProvider.trim();
+  }
+  if (typeof r.timeoutMs === "number" && r.timeoutMs > 0) {
+    config.timeoutMs = Math.floor(r.timeoutMs);
+  } else {
+    config.timeoutMs = 180_000;
+  }
+  if (typeof r.fallbackOnBusy === "boolean") {
+    config.fallbackOnBusy = r.fallbackOnBusy;
+  } else if (config.fallbackModel || config.fallbackProvider) {
+    config.fallbackOnBusy = true;
+  }
+  if (typeof r.fallbackOnFailure === "boolean") {
+    config.fallbackOnFailure = r.fallbackOnFailure;
+  } else {
+    config.fallbackOnFailure = false;
   }
   if (typeof r.routingEnabled === "boolean") {
     config.routingEnabled = r.routingEnabled;
@@ -424,9 +452,10 @@ export async function updateSessionState(params: {
   apiKey?: string;
   providerApi?: string;
   thinkingEnabled?: boolean;
+  timeoutMs?: number;
   log: { warn: (msg: string) => void };
-}): Promise<void> {
-  if (params.toolResults.length === 0) return;
+}): Promise<"updated" | "timeout" | "model_failure" | "empty" | "invalid_json" | "db_write_failed" | "skipped"> {
+  if (params.toolResults.length === 0) return "skipped";
 
   const current = loadSessionState(params.db, params.sessionId, params.agentId) ?? {
     sessionId: params.sessionId,
@@ -443,41 +472,101 @@ export async function updateSessionState(params: {
     ? { chat_template_kwargs: { enable_thinking: false } }
     : undefined;
 
-  const TIMEOUT_MS = 30_000;
+  const TIMEOUT_MS =
+    typeof params.timeoutMs === "number" && params.timeoutMs > 0
+      ? Math.floor(params.timeoutMs)
+      : 180_000;
+  const requestId = createUsageLogRequestId();
+  const abortController =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  const rawRequest = {
+    provider: params.provider,
+    model: params.model,
+    apiKey: params.apiKey,
+    providerApi: params.providerApi,
+    messages: [{ role: "user", content: prompt }],
+    system: SESSION_STATE_SYSTEM_PROMPT,
+    maxTokens: 512,
+    temperature: thinkingEnabled ? 0.5 : 0,
+    extraBody,
+    ...(abortController ? { signal: abortController.signal } : {}),
+  };
+  writeLlmUsageLog({
+    ts: new Date().toISOString(),
+    status: "started",
+    subsystem: "session-state",
+    provider: params.provider,
+    model: params.model,
+    requestId,
+    request: rawRequest,
+  });
 
   let responseText: string;
   try {
+    const completion = params.complete(rawRequest as Parameters<CompleteFn>[0]) as Promise<{
+      content: Array<{ type: string; text?: string; [key: string]: unknown }>;
+      [key: string]: unknown;
+    }> & {
+      abort?: () => void;
+      cancel?: () => void;
+      controller?: { abort?: () => void };
+    };
     const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`session-state update timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS),
+      setTimeout(() => {
+        try {
+          abortController?.abort();
+        } catch {}
+        try {
+          completion.abort?.();
+        } catch {}
+        try {
+          completion.cancel?.();
+        } catch {}
+        try {
+          completion.controller?.abort?.();
+        } catch {}
+        reject(new Error(`session-state update timed out after ${TIMEOUT_MS}ms`));
+      }, TIMEOUT_MS),
     );
     const result = await Promise.race([
-      params.complete({
-        provider: params.provider,
-        model: params.model,
-        apiKey: params.apiKey,
-        providerApi: params.providerApi,
-        messages: [{ role: "user", content: prompt }],
-        system: SESSION_STATE_SYSTEM_PROMPT,
-        maxTokens: 512,
-        // When thinking is enabled, a small temperature lets the reasoning phase explore;
-        // the output is still constrained by the strict JSON prompt.
-        temperature: thinkingEnabled ? 0.5 : 0,
-        extraBody,
-      }),
+      completion,
       timeoutPromise,
     ]);
+    writeLlmUsageLog({
+      ts: new Date().toISOString(),
+      status: "completed",
+      subsystem: "session-state",
+      provider: params.provider,
+      model: params.model,
+      requestId,
+      request: rawRequest,
+      response: result,
+    });
     const textBlock = result.content.find((b) => b.type === "text");
     responseText = textBlock?.text ?? "";
   } catch (err) {
+    writeLlmUsageLog({
+      ts: new Date().toISOString(),
+      status: "failed",
+      subsystem: "session-state",
+      provider: params.provider,
+      model: params.model,
+      requestId,
+      request: rawRequest,
+      error: err instanceof Error ? err.message : String(err),
+    });
     params.log.warn(
       `[lcm] session-state: model call failed — ${err instanceof Error ? err.message : String(err)}`,
     );
-    return;
+    if (err instanceof Error && err.message.includes("timed out")) {
+      return "timeout";
+    }
+    return "model_failure";
   }
 
   if (!responseText.trim()) {
     params.log.warn("[lcm] session-state: update returned empty response");
-    return;
+    return "empty";
   }
 
   // Strip markdown code fences and any thinking-mode preamble before the JSON
@@ -497,7 +586,7 @@ export async function updateSessionState(params: {
     parsed = JSON.parse(cleaned) as typeof parsed;
   } catch {
     params.log.warn("[lcm] session-state: could not parse update response as JSON");
-    return;
+    return "invalid_json";
   }
 
   // Merge fields (only allowed keys)
@@ -540,5 +629,7 @@ export async function updateSessionState(params: {
     params.log.warn(
       `[lcm] session-state: DB write failed — ${err instanceof Error ? err.message : String(err)}`,
     );
+    return "db_write_failed";
   }
+  return "updated";
 }

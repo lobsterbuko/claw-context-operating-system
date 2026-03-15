@@ -12,6 +12,11 @@
  *
  * Both are fire-and-forget-safe: failures log and fall back to FTS5.
  */
+import {
+  buildHttpUsageRequest,
+  createUsageLogRequestId,
+  writeLlmUsageLog,
+} from "./llm-usage-log.js";
 
 // ── Config types ──────────────────────────────────────────────────────────────
 
@@ -116,27 +121,88 @@ export async function embedTexts(
   texts: string[],
 ): Promise<number[][] | null> {
   if (texts.length === 0) return [];
+  const url = `${config.baseUrl}/embeddings`;
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${config.apiKey ?? "none"}`,
+  };
+  const body = {
+    model: config.model,
+    input: texts,
+    ...(config.dimensions ? { dimensions: config.dimensions } : {}),
+  };
+  const requestId = createUsageLogRequestId();
+  const startedAt = Date.now();
+  writeLlmUsageLog({
+    ts: new Date().toISOString(),
+    status: "started",
+    subsystem: "embedding",
+    model: config.model,
+    baseUrl: config.baseUrl,
+    endpoint: "/embeddings",
+    requestId,
+    request: buildHttpUsageRequest({ url, method: "POST", headers, body }),
+  });
   try {
-    const res = await fetch(`${config.baseUrl}/embeddings`, {
+    const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.apiKey ?? "none"}`,
-      },
-      body: JSON.stringify({
-        model: config.model,
-        input: texts,
-        ...(config.dimensions ? { dimensions: config.dimensions } : {}),
-      }),
+      headers,
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(30_000),
     });
-    if (!res.ok) return null;
-    const json = (await res.json()) as {
+    const responseText = await res.text();
+    let responseJson: unknown = responseText;
+    try {
+      responseJson = JSON.parse(responseText);
+    } catch {
+      // keep raw text
+    }
+    if (!res.ok) {
+      writeLlmUsageLog({
+        ts: new Date().toISOString(),
+        status: "failed",
+        subsystem: "embedding",
+        model: config.model,
+        baseUrl: config.baseUrl,
+        endpoint: "/embeddings",
+        requestId,
+        request: buildHttpUsageRequest({ url, method: "POST", headers, body }),
+        response: { status: res.status, statusText: res.statusText, body: responseJson },
+        error: `HTTP ${res.status} ${res.statusText}`,
+        durationMs: Date.now() - startedAt,
+      });
+      return null;
+    }
+    writeLlmUsageLog({
+      ts: new Date().toISOString(),
+      status: "completed",
+      subsystem: "embedding",
+      model: config.model,
+      baseUrl: config.baseUrl,
+      endpoint: "/embeddings",
+      requestId,
+      request: buildHttpUsageRequest({ url, method: "POST", headers, body }),
+      response: { status: res.status, statusText: res.statusText, body: responseJson },
+      durationMs: Date.now() - startedAt,
+    });
+    const json = responseJson as {
       data?: Array<{ embedding: number[] }>;
     };
     if (!json.data || json.data.length !== texts.length) return null;
     return json.data.map((d) => d.embedding);
-  } catch {
+  } catch (err) {
+    writeLlmUsageLog({
+      ts: new Date().toISOString(),
+      status: "failed",
+      subsystem: "embedding",
+      model: config.model,
+      baseUrl: config.baseUrl,
+      endpoint: "/embeddings",
+      requestId,
+      request: buildHttpUsageRequest({ url, method: "POST", headers, body }),
+      error: err instanceof Error ? err.message : String(err),
+      durationMs: Date.now() - startedAt,
+    });
     return null;
   }
 }
@@ -220,34 +286,81 @@ export async function rerankCandidates(
   candidates: Array<{ summaryId: string; content: string; vectorScore: number }>,
 ): Promise<RankedCandidate[]> {
   const topK = config.topK ?? 8;
+  const documents = candidates.map((c) => c.content.slice(0, 2000));
+  const url = `${config.baseUrl}/rerank`;
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${config.apiKey ?? "none"}`,
+  };
+  const body = {
+    model: config.model,
+    query,
+    documents,
+    top_n: topK,
+    ...(config.taskInstruction ? { instruction: config.taskInstruction } : {}),
+  };
+  const requestId = createUsageLogRequestId();
+  const startedAt = Date.now();
+  writeLlmUsageLog({
+    ts: new Date().toISOString(),
+    status: "started",
+    subsystem: "reranker",
+    model: config.model,
+    baseUrl: config.baseUrl,
+    endpoint: "/rerank",
+    requestId,
+    request: buildHttpUsageRequest({ url, method: "POST", headers, body }),
+  });
 
   try {
-    const documents = candidates.map((c) => c.content.slice(0, 2000));
-    const res = await fetch(`${config.baseUrl}/rerank`, {
+    const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.apiKey ?? "none"}`,
-      },
-      body: JSON.stringify({
-        model: config.model,
-        query,
-        documents,
-        top_n: topK,
-        ...(config.taskInstruction ? { instruction: config.taskInstruction } : {}),
-      }),
+      headers,
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(60_000),
     });
+    const responseText = await res.text();
+    let responseJson: unknown = responseText;
+    try {
+      responseJson = JSON.parse(responseText);
+    } catch {
+      // keep raw text
+    }
 
     if (!res.ok) {
+      writeLlmUsageLog({
+        ts: new Date().toISOString(),
+        status: "failed",
+        subsystem: "reranker",
+        model: config.model,
+        baseUrl: config.baseUrl,
+        endpoint: "/rerank",
+        requestId,
+        request: buildHttpUsageRequest({ url, method: "POST", headers, body }),
+        response: { status: res.status, statusText: res.statusText, body: responseJson },
+        error: `HTTP ${res.status} ${res.statusText}`,
+        durationMs: Date.now() - startedAt,
+      });
       // Fall back to vector order
       return candidates
         .sort((a, b) => b.vectorScore - a.vectorScore)
         .slice(0, topK)
         .map((c) => ({ summaryId: c.summaryId, content: c.content, score: c.vectorScore }));
     }
+    writeLlmUsageLog({
+      ts: new Date().toISOString(),
+      status: "completed",
+      subsystem: "reranker",
+      model: config.model,
+      baseUrl: config.baseUrl,
+      endpoint: "/rerank",
+      requestId,
+      request: buildHttpUsageRequest({ url, method: "POST", headers, body }),
+      response: { status: res.status, statusText: res.statusText, body: responseJson },
+      durationMs: Date.now() - startedAt,
+    });
 
-    const json = (await res.json()) as {
+    const json = responseJson as {
       results?: Array<{ index: number; relevance_score: number }>;
     };
 
@@ -266,7 +379,19 @@ export async function rerankCandidates(
         content: candidates[r.index].content,
         score: r.relevance_score,
       }));
-  } catch {
+  } catch (err) {
+    writeLlmUsageLog({
+      ts: new Date().toISOString(),
+      status: "failed",
+      subsystem: "reranker",
+      model: config.model,
+      baseUrl: config.baseUrl,
+      endpoint: "/rerank",
+      requestId,
+      request: buildHttpUsageRequest({ url, method: "POST", headers, body }),
+      error: err instanceof Error ? err.message : String(err),
+      durationMs: Date.now() - startedAt,
+    });
     return candidates
       .sort((a, b) => b.vectorScore - a.vectorScore)
       .slice(0, topK)

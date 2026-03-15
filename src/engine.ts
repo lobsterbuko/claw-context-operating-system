@@ -1355,17 +1355,28 @@ export class LcmContextEngine implements ContextEngine {
       const modelAccess = await this.resolveSummaryModelAccess(legacyParams);
       if (!modelAccess) return;
 
-      const routingEnabled = ssConfig.routingEnabled !== false && !!(ssConfig.fallbackModel || ssConfig.fallbackProvider);
+      const hasFallback = !!(ssConfig.fallbackModel || ssConfig.fallbackProvider);
+      const fallbackOnBusy =
+        typeof ssConfig.fallbackOnBusy === "boolean"
+          ? ssConfig.fallbackOnBusy
+          : ssConfig.routingEnabled !== false && hasFallback;
+      const fallbackOnFailure =
+        typeof ssConfig.fallbackOnFailure === "boolean"
+          ? ssConfig.fallbackOnFailure
+          : false;
       const compactionBusy = this.compactionInFlight > 0;
-      const useFallback = routingEnabled && compactionBusy;
-      if (compactionBusy && !routingEnabled) {
-        // Routing disabled and primary is busy — skip this update rather than queuing behind compaction.
-        this.deps.log.warn("[lcm] session-state: skipping update — compaction in flight, routing disabled");
+      const useFallback = fallbackOnBusy && compactionBusy;
+      if (compactionBusy && !useFallback) {
+        this.deps.log.warn("[lcm] session-state: skipping update — compaction in flight, fallbackOnBusy disabled");
         return;
       }
 
-      const ssProvider = (useFallback ? ssConfig.fallbackProvider : ssConfig.provider) ?? modelAccess.provider;
-      const ssModel = (useFallback ? ssConfig.fallbackModel : ssConfig.model) ?? modelAccess.model;
+      const primaryProvider = ssConfig.provider ?? modelAccess.provider;
+      const primaryModel = ssConfig.model ?? modelAccess.model;
+      const fallbackProvider = ssConfig.fallbackProvider ?? primaryProvider;
+      const fallbackModel = ssConfig.fallbackModel ?? primaryModel;
+      const ssProvider = useFallback ? fallbackProvider : primaryProvider;
+      const ssModel = useFallback ? fallbackModel : primaryModel;
       const ssApiKey = modelAccess.apiKey;
       const ssProviderApi = modelAccess.providerApi;
 
@@ -1376,7 +1387,7 @@ export class LcmContextEngine implements ContextEngine {
 
       const db = getLcmConnection(this.config.databasePath);
 
-      await updateSessionState({
+      const result = await updateSessionState({
         db,
         sessionId,
         agentId,
@@ -1389,8 +1400,32 @@ export class LcmContextEngine implements ContextEngine {
         apiKey: ssApiKey,
         providerApi: ssProviderApi,
         thinkingEnabled: ssConfig.thinkingEnabled ?? this.deps.config.summaryModelThinking,
+        timeoutMs: ssConfig.timeoutMs,
         log: this.deps.log,
       });
+      const shouldRetryOnFallback =
+        !useFallback &&
+        hasFallback &&
+        fallbackOnFailure &&
+        (result === "timeout" || result === "model_failure" || result === "empty" || result === "invalid_json");
+      if (shouldRetryOnFallback) {
+        await updateSessionState({
+          db,
+          sessionId,
+          agentId,
+          config: ssConfig,
+          toolResults,
+          timezone: this.timezone,
+          complete: this.deps.complete,
+          provider: fallbackProvider,
+          model: fallbackModel,
+          apiKey: ssApiKey,
+          providerApi: ssProviderApi,
+          thinkingEnabled: ssConfig.thinkingEnabled ?? this.deps.config.summaryModelThinking,
+          timeoutMs: ssConfig.timeoutMs,
+          log: this.deps.log,
+        });
+      }
     } catch (err) {
       this.deps.log.warn(
         `[lcm] session-state: maybeUpdateSessionState failed — ${err instanceof Error ? err.message : String(err)}`,
@@ -1526,6 +1561,7 @@ export class LcmContextEngine implements ContextEngine {
         params.tokenBudget > 0
           ? Math.floor(params.tokenBudget)
           : 128_000;
+      const contextPolicy = this.loadPolicyForSession(params.sessionId);
 
       // Ozempic: pre-assembly pressure loop.
       // If context is above pressure threshold, run compaction passes before
@@ -1540,7 +1576,9 @@ export class LcmContextEngine implements ContextEngine {
               tokenBudget,
             );
             if (!decision.shouldCompact) break;
-            const summarize = await this.resolveSummarize({});
+            const summarize = await this.resolveSummarize({
+              customInstructions: contextPolicy?.summaryInstructions,
+            });
             await this.compaction.compactLeaf({
               conversationId: conversation.conversationId,
               tokenBudget,
@@ -1552,8 +1590,6 @@ export class LcmContextEngine implements ContextEngine {
           // Pressure loop is best-effort — never abort assembly.
         }
       }
-
-      const contextPolicy = this.loadPolicyForSession(params.sessionId);
 
       // Ozempic Tier 3: load and render session state block if configured.
       // Its tokens are subtracted from the budget before assembly so the
@@ -1736,9 +1772,10 @@ export class LcmContextEngine implements ContextEngine {
             }
           ).currentTokenCount,
       );
+      const policy = this.loadPolicyForSession(params.sessionId, params.sessionFile);
       const summarize = await this.resolveSummarize({
         legacyParams: params.legacyParams,
-        customInstructions: params.customInstructions,
+        customInstructions: params.customInstructions ?? policy?.summaryInstructions,
       });
 
       const leafResult = await this.compaction.compactLeaf({
@@ -1844,9 +1881,10 @@ export class LcmContextEngine implements ContextEngine {
         };
       }
 
+      const policy = this.loadPolicyForSession(params.sessionId, params.sessionFile);
       const summarize = await this.resolveSummarize({
         legacyParams: params.legacyParams,
-        customInstructions: params.customInstructions,
+        customInstructions: params.customInstructions ?? policy?.summaryInstructions,
       });
 
       // Evaluate whether compaction is needed (unless forced)
