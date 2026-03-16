@@ -4,6 +4,9 @@ The mission is simple: make small, locally run agents feel dramatically less con
 
 Architecture is explained visually in two CCOS block diagrams: [Turn_Flow_Diagram.png](/Users/jbukow/.openclaw/claw-context-operating-system/Turn_Flow_Diagram.png) and [Context_Assembly_Details.png](/Users/jbukow/.openclaw/claw-context-operating-system/Context_Assembly_Details.png).
 
+![Turn Flow Diagram](/Users/jbukow/.openclaw/claw-context-operating-system/Turn_Flow_Diagram.png)
+![Context Assembly Details](/Users/jbukow/.openclaw/claw-context-operating-system/Context_Assembly_Details.png)
+
 -----------------------------------------------------------------------------
 MOST IMPORTANT THINGS CCOS CHANGES
 -----------------------------------------------------------------------------
